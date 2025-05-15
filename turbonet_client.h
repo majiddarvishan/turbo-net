@@ -20,6 +20,7 @@ using PacketHandler = std::function<void(uint8_t packetId,
                                          const std::vector<uint8_t>& payload)>;
 using TimeoutHandler = std::function<void(uint32_t sequence)>;
 using BindHandler = std::function<void(const std::string& serverId)>;
+using CloseHandler = std::function<void()>;
 
 class TurboNetClient : public std::enable_shared_from_this<TurboNetClient> {
 public:
@@ -39,6 +40,7 @@ public:
     void setClientId(const std::string& clientId);
     // Bind-response handler
     void setBindHandler(BindHandler handler);
+    void setCloseHandler(CloseHandler handler);
 
     // Send arbitrary packet
     void sendPacket(uint8_t packetId,
@@ -107,6 +109,7 @@ private:
     PacketHandler                                     onPacket_;
     TimeoutHandler                                    onTimeout_;
     BindHandler                                       onBind_;
+    CloseHandler onClose_;
     std::function<void(const asio::error_code&)>      connectHandler_;
 
     int                                               readTimeoutMs_;

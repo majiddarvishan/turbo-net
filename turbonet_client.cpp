@@ -59,6 +59,10 @@ void TurboNetClient::setTimeoutHandler(TimeoutHandler handler) {
     onTimeout_ = std::move(handler);
 }
 
+void TurboNetClient::setCloseHandler(CloseHandler handler) {
+    onClose_ = std::move(handler);
+}
+
 void TurboNetClient::connect(const std::string& host,
                              uint16_t port,
                              int timeoutMs,
@@ -122,6 +126,11 @@ void TurboNetClient::close() {
     cancelReadTimer();
     cancelWriteTimer();
     responseSweepTimer_.cancel(ec);
+
+    // Notify user of closure
+    if (onClose_) {
+        onClose_();
+    }
 }
 
 // I/O Implementation
