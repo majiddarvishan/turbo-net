@@ -1,52 +1,12 @@
-# cmake_minimum_required(VERSION 3.14)
-# project(TurboNetClient)
-
-# # Enable C++17
-# set(CMAKE_CXX_STANDARD 17)
-# set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# # Enable CPM
-# include(FetchContent)
-# FetchContent_Declare(
-#   CPM
-#   GIT_REPOSITORY https://github.com/cpm-cmake/CPM.cmake
-#   GIT_TAG origin/master
-# )
-# FetchContent_MakeAvailable(CPM)
-
-# # Fetch standalone Asio via CPM
-# CPMAddPackage(
-#   NAME asio
-#   GITHUB_REPOSITORY chriskohlhoff/asio
-#   VERSION 1.34.2
-#   GIT_TAG asio-1-34-2
-#   OPTIONS "ASIO_NO_DEPRECATED=1"
-#           "ASIO_STANDALONE ON"
-# )
-
-# # Create your executable
-# add_executable(turbonet_example
-#   main.cpp
-#   turbonet_client.cpp
-# )
-
-# # Include headers
-# target_include_directories(turbonet_example PRIVATE ${asio_SOURCE_DIR}/asio/include)
-# target_compile_definitions(turbonet PUBLIC ASIO_STANDALONE)
-
-# # Link asio
-# target_link_libraries(turbonet_example PRIVATE asio)
-
-# # Threads
-# find_package(Threads REQUIRED)
-# target_link_libraries(turbonet_example PRIVATE Threads::Threads)
-
-
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.14)
 project(TurboNetClient LANGUAGES CXX)
 
+# # Enable C++17
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_compile_definitions(DEBUG)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -g")
 
 # Download and include CPM.cmake
 include(FetchContent)
@@ -76,6 +36,9 @@ CPMAddPackage(
 add_library(turbonet
   turbonet_client.cpp
   turbonet_client.h
+
+  turbonet_server.cpp
+  turbonet_server.h
 )
 
 target_link_libraries(turbonet
@@ -91,3 +54,13 @@ target_link_libraries(example_client
                       turbonet
                       Boost::asio
                      )
+
+add_executable(example_server server.cpp)
+target_link_libraries(example_server
+                      turbonet
+                      Boost::asio
+                     )
+
+# # Threads
+# find_package(Threads REQUIRED)
+# target_link_libraries(turbonet_example PRIVATE Threads::Threads)
