@@ -58,12 +58,19 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(CPM)
 
 # Asio (standalone, header-only)
+# CPMAddPackage(
+#   NAME asio
+#   GITHUB_REPOSITORY chriskohlhoff/asio
+#   VERSION 1.34.2
+#   GIT_TAG asio-1-34-2
+#   OPTIONS "ASIO_STANDALONE ON"
+# )
+
 CPMAddPackage(
-  NAME asio
-  GITHUB_REPOSITORY chriskohlhoff/asio
-  VERSION 1.34.2
-  GIT_TAG asio-1-34-2
-  OPTIONS "ASIO_STANDALONE ON"
+  NAME Boost
+  VERSION 1.86.0
+  GITHUB_REPOSITORY "boostorg/boost"
+  GIT_TAG "boost-1.86.0"
 )
 
 add_library(turbonet
@@ -71,9 +78,18 @@ add_library(turbonet
   turbonet_client.h
 )
 
-target_include_directories(turbonet PUBLIC ${asio_SOURCE_DIR}/asio/include)
-target_compile_definitions(turbonet PUBLIC ASIO_STANDALONE)
+
+target_link_libraries(turbonet
+                      PRIVATE
+                      Boost::asio
+                     )
+
+# target_include_directories(turbonet PUBLIC ${asio_SOURCE_DIR}/asio/include)
+# target_compile_definitions(turbonet PUBLIC ASIO_STANDALONE)
 
 # Optional: Example executable
 add_executable(example_client main.cpp)
-target_link_libraries(example_client turbonet)
+target_link_libraries(example_client
+turbonet
+                      Boost::asio
+                      )

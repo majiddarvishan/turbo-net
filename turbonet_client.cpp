@@ -1,8 +1,22 @@
-// File: turbonet_client.cpp
 #include "turbonet_client.h"
+#include <cstring>
+#include <asio/connect.hpp>
+#include <asio/write.hpp>
+#include <asio/ip/tcp.hpp>
 
 namespace turbonet {
 
+// Helpers
+uint32_t TurboNetClient::toBigEndian(uint32_t v) {
+    return htonl(v);
+}
+uint32_t TurboNetClient::fromBigEndian(const uint8_t* b) {
+    uint32_t v;
+    std::memcpy(&v, b, 4);
+    return ntohl(v);
+}
+
+// Constructor / Destructor
 TurboNetClient::TurboNetClient(int readTimeoutMs,
                                int writeTimeoutMs,
                                int responseTimeoutMs,
@@ -18,23 +32,36 @@ TurboNetClient::TurboNetClient(int readTimeoutMs,
       readTimeoutMs_(readTimeoutMs),
       writeTimeoutMs_(writeTimeoutMs),
       responseTimeoutMs_(responseTimeoutMs) {
-    for (std::size_t i = 0; i < ioThreads; ++i) {
-        ioThreads_.emplace_back([this]() { ioCtx_.run(); });
-    }
     running_ = true;
+    for (std::size_t i = 0; i < ioThreads; ++i) {
+        ioThreads_.emplace_back([this] { ioCtx_.run(); });
+    }
 }
 
 TurboNetClient::~TurboNetClient() {
     close();
     workGuard_.reset();
     ioCtx_.stop();
-    for (auto& t : ioThreads_) {
-        if (t.joinable())
-            t.join();
-    }
+    for (auto& t : ioThreads_) if (t.joinable()) t.join();
 }
 
-void TurboNetClient::connect(const std::string& host, uint16_t port, int timeoutMs,
+// Public API
+void TurboNetClient::setClientId(const std::string& clientId) {
+    clientId_ = clientId;
+}
+void TurboNetClient::setBindHandler(BindHandler handler) {
+    onBind_ = std::move(handler);
+}
+void TurboNetClient::setPacketHandler(PacketHandler handler) {
+    onPacket_ = std::move(handler);
+}
+void TurboNetClient::setTimeoutHandler(TimeoutHandler handler) {
+    onTimeout_ = std::move(handler);
+}
+
+void TurboNetClient::connect(const std::string& host,
+                             uint16_t port,
+                             int timeoutMs,
                              std::function<void(const asio::error_code&)> onConnect) {
     connectHandler_ = std::move(onConnect);
     asio::ip::tcp::resolver resolver(ioCtx_);
@@ -42,214 +69,49 @@ void TurboNetClient::connect(const std::string& host, uint16_t port, int timeout
 
     startConnectTimer(timeoutMs);
     asio::async_connect(socket_, endpoints,
-        asio::bind_executor(strand_, [self = shared_from_this()](const asio::error_code& ec, const asio::ip::tcp::endpoint&) {
+        asio::bind_executor(strand_, [self = shared_from_this()](const asio::error_code& ec, auto&) {
             self->cancelConnectTimer();
-            if (!ec) self->doReadHeader();
+            if (!ec) {
+                // Auto-bind
+                if (!self->clientId_.empty()) {
+                    uint32_t seq = self->sequenceCounter_++;
+                    self->sendPacket(0x01, 0x00, seq,
+                                     reinterpret_cast<const uint8_t*>(self->clientId_.data()),
+                                     self->clientId_.size());
+                }
+                self->doReadHeader();
+            }
             if (self->connectHandler_) self->connectHandler_(ec);
-        })
-    );
+        }));
 }
 
-void TurboNetClient::startConnectTimer(int timeoutMs) {
-    if (timeoutMs <= 0) return;
-    connectTimer_.expires_after(std::chrono::milliseconds(timeoutMs));
-    connectTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](const asio::error_code& ec) {
-        self->onConnectTimeout(ec);
-    }));
-}
-
-void TurboNetClient::cancelConnectTimer() {
-    try
-    {
-        connectTimer_.cancel();
-    }
-    catch(asio::error_code& ec)
-    {}
-}
-
-void TurboNetClient::onConnectTimeout(const asio::error_code& ec) {
-    if (!ec) {
-        asio::error_code ignored;
-        socket_.close(ignored);
-    }
-}
-
-void TurboNetClient::doReadHeader() {
-    asio::async_read(socket_, asio::buffer(headerBuf_),
-        asio::bind_executor(strand_, [self = shared_from_this()](const asio::error_code& ec, std::size_t bytes_transferred) {
-            self->onReadHeader(ec, bytes_transferred);
-        })
-    );
-}
-
-void TurboNetClient::onReadHeader(const asio::error_code& ec, std::size_t) {
-    if (ec) return;
-
-    uint32_t packetLen = fromBigEndian(&headerBuf_[0]);
-    lastPacketId_ = headerBuf_[4];
-    lastStatus_ = headerBuf_[5];
-    lastSequence_ = fromBigEndian(&headerBuf_[6]);
-
-    if (packetLen < 10) return; // invalid packet
-    doReadBody(packetLen - 10);
-}
-
-void TurboNetClient::doReadBody(uint32_t bodyLen) {
-    bodyBuf_.resize(bodyLen);
-    asio::async_read(socket_, asio::buffer(bodyBuf_),
-        asio::bind_executor(strand_, [self = shared_from_this()](const asio::error_code& ec, std::size_t bytes_transferred) {
-            self->onReadBody(ec, bytes_transferred);
-        })
-    );
-}
-
-void TurboNetClient::onReadBody(const asio::error_code& ec, std::size_t) {
-    if (!ec && onPacket_) {
-        onPacket_(lastPacketId_, lastStatus_, lastSequence_, bodyBuf_);
-    }
-    cancelReadTimer();
-    doReadHeader();
-}
-
-void TurboNetClient::sendPacket(uint8_t packetId, uint8_t status, uint32_t sequence,
-                                const uint8_t* data, std::size_t len) {
-    std::vector<uint8_t> packet(10 + len);
+void TurboNetClient::sendPacket(uint8_t packetId,
+                                uint8_t status,
+                                uint32_t sequence,
+                                const uint8_t* data,
+                                std::size_t len) {
+    std::vector<uint8_t> pkt(10 + len);
     uint32_t totalLen = 10 + static_cast<uint32_t>(len);
+    uint32_t beLen = toBigEndian(totalLen);
+    std::memcpy(pkt.data(), &beLen, 4);
+    pkt[4] = packetId;
+    pkt[5] = status;
+    uint32_t beSeq = toBigEndian(sequence);
+    std::memcpy(pkt.data() + 6, &beSeq, 4);
+    std::memcpy(pkt.data() + 10, data, len);
 
-    uint32_t lenBE = toBigEndian(totalLen);
-    std::memcpy(&packet[0], &lenBE, 4);
-    packet[4] = packetId;
-    packet[5] = status;
-    uint32_t seqBE = toBigEndian(sequence);
-    std::memcpy(&packet[6], &seqBE, 4);
-    std::memcpy(&packet[10], data, len);
-
-    asio::post(strand_, [self = shared_from_this(), packet = std::move(packet)]() mutable {
-        self->txBuffer_.insert(self->txBuffer_.end(), packet.begin(), packet.end());
-        if (self->txBuffer_.size() == packet.size()) {
-            self->doWrite();
-        }
+    asio::post(strand_, [self = shared_from_this(), pkt = std::move(pkt)]() mutable {
+        bool writing = !self->txBuffer_.empty();
+        self->txBuffer_.insert(self->txBuffer_.end(), pkt.begin(), pkt.end());
+        if (!writing) self->doWrite();
     });
 }
 
 uint32_t TurboNetClient::sendRequest(const uint8_t* data, std::size_t len) {
-    uint32_t seq = sequenceCounter_.fetch_add(1);
+    uint32_t seq = sequenceCounter_++;
     sendPacket(0x02, 0x00, seq, data, len);
     startResponseTimer(seq);
     return seq;
-}
-
-void TurboNetClient::doWrite() {
-    startWriteTimer();
-    asio::async_write(socket_, asio::buffer(txBuffer_),
-        asio::bind_executor(strand_, [self = shared_from_this()](const asio::error_code& ec, std::size_t bytes_transferred) {
-            self->onWrite(ec, bytes_transferred);
-        })
-    );
-}
-
-void TurboNetClient::onWrite(const asio::error_code& ec, std::size_t) {
-    cancelWriteTimer();
-    txBuffer_.clear();
-}
-
-void TurboNetClient::startReadTimer() {
-    if (readTimeoutMs_ <= 0) return;
-    readTimer_.expires_after(std::chrono::milliseconds(readTimeoutMs_));
-    readTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](const asio::error_code& ec) {
-        self->onReadTimeout(ec);
-    }));
-}
-
-void TurboNetClient::cancelReadTimer() {
-    try
-    {
-        readTimer_.cancel();
-    }
-    catch(asio::error_code& ec)
-    {}
-}
-
-void TurboNetClient::onReadTimeout(const asio::error_code& ec) {
-    if (!ec) socket_.close();
-}
-
-void TurboNetClient::startWriteTimer() {
-    if (writeTimeoutMs_ <= 0) return;
-    writeTimer_.expires_after(std::chrono::milliseconds(writeTimeoutMs_));
-    writeTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](const asio::error_code& ec) {
-        self->onWriteTimeout(ec);
-    }));
-}
-
-void TurboNetClient::cancelWriteTimer() {
-    try
-    {
-        writeTimer_.cancel();
-    }
-    catch(asio::error_code& ec)
-    {}
-}
-
-void TurboNetClient::onWriteTimeout(const asio::error_code& ec) {
-    if (!ec) socket_.close();
-}
-
-void TurboNetClient::startResponseTimer(uint32_t sequence) {
-    if (responseTimeoutMs_ <= 0) return;
-    auto expiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(responseTimeoutMs_);
-    {
-        std::scoped_lock lock(responseMutex_);
-        responseMap_[sequence] = expiry;
-        responseQueue_.push({ sequence, expiry });
-    }
-
-    responseSweepTimer_.expires_after(std::chrono::milliseconds(responseTimeoutMs_));
-    responseSweepTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](const asio::error_code& ec) {
-        self->checkAndFireResponseTimers(ec);
-    }));
-}
-
-void TurboNetClient::checkAndFireResponseTimers(const asio::error_code& ec) {
-    if (ec) return;
-
-    auto now = std::chrono::steady_clock::now();
-    std::vector<uint32_t> expired;
-
-    {
-        std::scoped_lock lock(responseMutex_);
-        while (!responseQueue_.empty() && responseQueue_.top().expiry <= now) {
-            uint32_t seq = responseQueue_.top().sequence;
-            responseQueue_.pop();
-            auto it = responseMap_.find(seq);
-            if (it != responseMap_.end() && it->second <= now) {
-                expired.push_back(seq);
-                responseMap_.erase(it);
-            }
-        }
-    }
-
-    for (auto seq : expired) {
-        if (onTimeout_) onTimeout_(seq);
-    }
-
-    // Reset timer to next earliest
-    std::chrono::steady_clock::time_point nextExpiry = now + std::chrono::hours(24);
-    {
-        std::scoped_lock lock(responseMutex_);
-        if (!responseQueue_.empty()) {
-            nextExpiry = responseQueue_.top().expiry;
-        }
-    }
-    responseSweepTimer_.expires_at(nextExpiry);
-    responseSweepTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](const asio::error_code& ec) {
-        self->checkAndFireResponseTimers(ec);
-    }));
-}
-
-void TurboNetClient::cancelResponseTimer(uint32_t sequence) {
-    std::scoped_lock lock(responseMutex_);
-    responseMap_.erase(sequence);
 }
 
 void TurboNetClient::close() {
@@ -259,24 +121,155 @@ void TurboNetClient::close() {
     cancelConnectTimer();
     cancelReadTimer();
     cancelWriteTimer();
+    responseSweepTimer_.cancel(ec);
 }
 
-void TurboNetClient::setPacketHandler(PacketHandler handler) {
-    onPacket_ = std::move(handler);
+// I/O Implementation
+void TurboNetClient::doReadHeader() {
+    startReadTimer();
+    asio::async_read(socket_, asio::buffer(headerBuf_),
+        asio::bind_executor(strand_, [self = shared_from_this()](auto ec, auto n) {
+            self->onReadHeader(ec, n);
+        }));
 }
 
-void TurboNetClient::setTimeoutHandler(TimeoutHandler handler) {
-    onTimeout_ = std::move(handler);
+void TurboNetClient::onReadHeader(const asio::error_code& ec, std::size_t) {
+    if (ec) { cancelReadTimer(); return; }
+
+    uint32_t packetLen = fromBigEndian(headerBuf_.data());
+    lastPacketId_ = headerBuf_[4];
+    lastStatus_   = headerBuf_[5];
+    lastSequence_ = fromBigEndian(headerBuf_.data() + 6);
+
+    if (packetLen >= 10) doReadBody(packetLen - 10);
+    else doReadHeader();
 }
 
-uint32_t TurboNetClient::toBigEndian(uint32_t v) {
-    return htonl(v);
+void TurboNetClient::doReadBody(uint32_t bodyLen) {
+    bodyBuf_.resize(bodyLen);
+    asio::async_read(socket_, asio::buffer(bodyBuf_),
+        asio::bind_executor(strand_, [self = shared_from_this()](auto ec, auto n) {
+            self->onReadBody(ec, n);
+        }));
 }
 
-uint32_t TurboNetClient::fromBigEndian(const uint8_t* b) {
-    uint32_t v;
-    std::memcpy(&v, b, 4);
-    return ntohl(v);
+void TurboNetClient::onReadBody(const asio::error_code& ec, std::size_t) {
+    cancelReadTimer();
+    if (!ec) {
+        // Bind-response
+        if (lastPacketId_ == 0x81 && onBind_) {
+            std::string sid(bodyBuf_.begin(), bodyBuf_.end());
+            onBind_(sid);
+        }
+        // Generic
+        if (onPacket_) {
+            onPacket_(lastPacketId_, lastStatus_, lastSequence_, bodyBuf_);
+        }
+    }
+    if (running_) doReadHeader();
+}
+
+void TurboNetClient::doWrite() {
+    startWriteTimer();
+    asio::async_write(socket_, asio::buffer(txBuffer_),
+        asio::bind_executor(strand_, [self = shared_from_this()](auto ec, auto n) {
+            self->onWrite(ec, n);
+        }));
+}
+
+void TurboNetClient::onWrite(const asio::error_code& ec, std::size_t) {
+    cancelWriteTimer();
+    if (!ec) txBuffer_.clear();
+}
+
+// Timer Implementation
+void TurboNetClient::startConnectTimer(int timeoutMs) {
+    if (timeoutMs <= 0) return;
+    connectTimer_.expires_after(std::chrono::milliseconds(timeoutMs));
+    connectTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
+        self->onConnectTimeout(ec);
+    }));
+}
+void TurboNetClient::cancelConnectTimer() {
+    asio::error_code ec; connectTimer_.cancel(ec);
+}
+void TurboNetClient::onConnectTimeout(const asio::error_code& ec) {
+    if (!ec) socket_.close();
+}
+
+void TurboNetClient::startReadTimer() {
+    if (readTimeoutMs_ <= 0) return;
+    readTimer_.expires_after(std::chrono::milliseconds(readTimeoutMs_));
+    readTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
+        self->onReadTimeout(ec);
+    }));
+}
+void TurboNetClient::cancelReadTimer() {
+    asio::error_code ec; readTimer_.cancel(ec);
+}
+void TurboNetClient::onReadTimeout(const asio::error_code& ec) {
+    if (!ec) socket_.close();
+}
+
+void TurboNetClient::startWriteTimer() {
+    if (writeTimeoutMs_ <= 0) return;
+    writeTimer_.expires_after(std::chrono::milliseconds(writeTimeoutMs_));
+    writeTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
+        self->onWriteTimeout(ec);
+    }));
+}
+void TurboNetClient::cancelWriteTimer() {
+    asio::error_code ec; writeTimer_.cancel(ec);
+}
+void TurboNetClient::onWriteTimeout(const asio::error_code& ec) {
+    if (!ec) socket_.close();
+}
+
+// Response Timeout
+void TurboNetClient::startResponseTimer(uint32_t sequence) {
+    if (responseTimeoutMs_ <= 0) return;
+    auto expiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(responseTimeoutMs_);
+    {
+        std::lock_guard lock(responseMutex_);
+        responseMap_[sequence] = expiry;
+        responseQueue_.push({sequence, expiry});
+    }
+    responseSweepTimer_.expires_after(std::chrono::milliseconds(responseTimeoutMs_));
+    responseSweepTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
+        self->checkAndFireResponseTimers(ec);
+    }));
+}
+
+void TurboNetClient::cancelResponseTimer(uint32_t sequence) {
+    std::lock_guard lock(responseMutex_);
+    responseMap_.erase(sequence);
+}
+
+void TurboNetClient::checkAndFireResponseTimers(const asio::error_code& ec) {
+    if (ec) return;
+    auto now = std::chrono::steady_clock::now();
+    std::vector<uint32_t> expired;
+    {
+        std::lock_guard lock(responseMutex_);
+        while (!responseQueue_.empty() && responseQueue_.top().expiry <= now) {
+            uint32_t seq = responseQueue_.top().sequence;
+            responseQueue_.pop();
+            if (responseMap_.erase(seq)) expired.push_back(seq);
+        }
+    }
+    for (auto seq : expired) {
+        if (onTimeout_) onTimeout_(seq);
+    }
+    // Reschedule next
+    std::chrono::steady_clock::time_point next = now + std::chrono::hours(24);
+    {
+        std::lock_guard lock(responseMutex_);
+        if (!responseQueue_.empty()) next = responseQueue_.top().expiry;
+    }
+    responseSweepTimer_.expires_at(next);
+    responseSweepTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
+        self->checkAndFireResponseTimers(ec);
+    }));
 }
 
 } // namespace turbonet
