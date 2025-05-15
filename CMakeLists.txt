@@ -78,7 +78,6 @@ add_library(turbonet
   turbonet_client.h
 )
 
-
 target_link_libraries(turbonet
                       PRIVATE
                       Boost::asio
@@ -87,9 +86,8 @@ target_link_libraries(turbonet
 # target_include_directories(turbonet PUBLIC ${asio_SOURCE_DIR}/asio/include)
 # target_compile_definitions(turbonet PUBLIC ASIO_STANDALONE)
 
-# Optional: Example executable
-add_executable(example_client main.cpp)
+add_executable(example_client client.cpp)
 target_link_libraries(example_client
-turbonet
+                      turbonet
                       Boost::asio
-                      )
+                     )
