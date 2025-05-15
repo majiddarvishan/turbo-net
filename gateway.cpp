@@ -3,73 +3,80 @@
 #include <iostream>
 #include <unordered_map>
 #include <mutex>
-#include <thread>
+#include <memory>
 
 using namespace turbonet;
 
-int main()
- {
-    // 1. Incoming server: listens for external producers on port 8000
+int main() {
+    // 1. Listen for upstream producers on port 8000
     TurboNetServer server(8000, /*maxConns=*/50);
 
-    // 2. Outgoing client: connects to downstream processor on localhost:9000
+    // 2. Connect downstream to processor at localhost:9000
     auto client = std::make_shared<TurboNetClient>(5000, 5000, 10000);
+    client->connect("127.0.0.1", 9000, 3000,
+        [&](const asio::error_code& ec){
+            if (ec) std::cerr << "Downstream connect failed: " << ec.message() << "\n";
+            else    std::cout << "Connected downstream\n";
+        });
 
-    // Map originalSeq -> gateway-generated seq for response correlation
-    std::mutex mapMutex;
-    std::unordered_map<uint32_t, uint32_t> seqMap;
+    // Map originalSeq -> (downstreamSeq, respond callback)
+    // Protected by mutex since callbacks run on different strands/threads
+    struct Pending { uint32_t downstreamSeq;
+                     std::function<void(uint8_t,uint8_t,uint32_t,const std::vector<uint8_t>&)> respond; };
+    std::mutex                    mapMtx;
+    std::unordered_map<uint32_t, Pending> pendingMap;
 
-    // 3. When client gets a response, forward it back to original producer
+    // When downstream replies, look up and invoke only that session’s respond
     client->setPacketHandler(
-        [&](uint8_t packetId, uint8_t status, uint32_t cseq, const std::vector<uint8_t>& payload) {
-            std::lock_guard<std::mutex> lk(mapMutex);
-            // find original sequence
-            auto it = std::find_if(seqMap.begin(), seqMap.end(),
-                                   [&](auto &p){ return p.second == cseq; });
-            if (it != seqMap.end()) {
-                uint32_t origSeq = it->first;
-                seqMap.erase(it);
-                // send back to producer via server’s respond lambda
-                // Note: we can store per-session respond lambdas in Session or pass through
-                // For simplicity, we echo to all connected sessions:
-                server.start([&](uint8_t, uint8_t, uint32_t, const std::vector<uint8_t>&, auto respond){
-                    respond(packetId, status, origSeq, payload);
-                });
+        [&](uint8_t pid, uint8_t status, uint32_t dseq, const std::vector<uint8_t>& body){
+            std::function<void(uint8_t,uint8_t,uint32_t,const std::vector<uint8_t>&)> respond;
+            uint32_t origSeq = 0;
+            {
+                std::lock_guard<std::mutex> lk(mapMtx);
+                for (auto it = pendingMap.begin(); it != pendingMap.end(); ++it) {
+                    if (it->second.downstreamSeq == dseq) {
+                        origSeq = it->first;
+                        respond = std::move(it->second.respond);
+                        pendingMap.erase(it);
+                        break;
+                    }
+                }
+            }
+            if (respond) {
+                // forward reply back to that producer session
+                respond(pid, status, origSeq, body);
+            } else {
+                std::cerr << "[gateway] Unexpected downstream seq=" << dseq << "\n";
             }
         });
 
-    // Connect client immediately
-    client->connect("127.0.0.1", 9000, 3000, [&](const asio::error_code& ec){
-        if (ec) std::cerr << "Gateway→client connect failed: " << ec.message() << "\n";
-        else    std::cout << "Gateway connected to downstream\n";
-    });
-
-    // 4. Server request handler: forward to client
-    server.setAuthHandler([](const std::string&){ return true; }); // skip auth
+    // 3. Start accepting producer connections
+    server.setAuthHandler([](auto const&){ return true; });
     server.start(
-        [&](uint8_t pid, uint8_t status, uint32_t seq,
-            const std::vector<uint8_t>& payload,
-            std::function<void(uint8_t,uint8_t,uint32_t,const std::vector<uint8_t>&)> respond)
+        [&](uint8_t pid,
+            uint8_t status,
+            uint32_t seq,
+            const std::vector<uint8_t>& body,
+            auto respond)
     {
         // Only forward request packets (0x02)
         if (pid == 0x02) {
-            // sendRequest returns new sequence
-            uint32_t newSeq = client->sendRequest(payload.data(), payload.size());
+            // sendRequest returns new downstream sequence
+            uint32_t dseq = client->sendRequest(body.data(), body.size());
             {
-                std::lock_guard<std::mutex> lk(mapMutex);
-                seqMap[seq] = newSeq;
+                std::lock_guard<std::mutex> lk(mapMtx);
+                // stash downstream seq + respond callback
+                pendingMap.emplace(seq, Pending{dseq, respond});
             }
-            // we will reply later via client callback
         }
         else {
-            // ignore or handle other packet types directly
-            respond(pid, status, seq, payload);
+            // direct echo for other packets
+            respond(pid, status, seq, body);
         }
     });
 
-    std::cout << "Gateway running. Press Enter to quit.\n";
+    std::cout << "Gateway running. Press Enter to stop...\n";
     std::cin.get();
-
     server.stop();
     client->close();
     return 0;
