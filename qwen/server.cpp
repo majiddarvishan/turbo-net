@@ -51,6 +51,7 @@ public:
 
     void start() {
         do_read_length();
+        start_heartbeat();
     }
 
     void set_session_id(session_id_type id) { session_id_ = id; }
@@ -67,6 +68,12 @@ public:
         post_write(std::move(packet));
     }
 
+    void graceful_close() {
+        std::vector<uint8_t> empty_payload;
+        send_packet(PKT_UNBIND_RESP, 0x00, generate_sequence_number(), empty_payload);
+        socket_.shutdown(tcp::socket::shutdown_both, [](boost::system::error_code) {});
+    }
+
 private:
     tcp::socket socket_;
     boost::asio::io_context::strand strand_;
@@ -75,6 +82,28 @@ private:
     uint8_t length_buffer_[length_size];
     std::vector<uint8_t> message_buffer_;
     std::deque<std::vector<uint8_t>> write_queue_;
+
+    std::shared_ptr<boost::asio::steady_timer> heartbeat_timer_;
+    uint32_t last_heartbeat_seq_ = 0;
+
+    void start_heartbeat() {
+        heartbeat_timer_ = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
+        heartbeat_timer_->expires_after(std::chrono::seconds(10));
+        heartbeat_timer_->async_wait([this](const boost::system::error_code& ec) {
+            if (!ec) {
+                std::cerr << "Session heartbeat timeout\n";
+                if (server_.lock()) {
+                    server_.lock()->remove_session(session_id_);
+                }
+            } else if (ec != boost::asio::error::operation_aborted) {
+                std::cerr << "Heartbeat timer error: " << ec.message() << std::endl;
+            }
+        });
+
+        last_heartbeat_seq_ = generate_sequence_number();
+        std::vector<uint8_t> empty_payload;
+        send_packet(PKT_HEARTBEAT_REQ, 0x00, last_heartbeat_seq_, empty_payload);
+    }
 
     void do_read_length() {
         auto self(shared_from_this());
@@ -142,6 +171,15 @@ private:
             case PKT_UNBIND_REQ:
                 send_packet(PKT_UNBIND_RESP, 0x00, sequence, {});
                 break;
+            case PKT_HEARTBEAT_RESP:
+                if (sequence == last_heartbeat_seq_) {
+                    heartbeat_timer_->cancel();
+                    strand_.post([this]() { start_heartbeat(); });
+                } else {
+                    std::cerr << "Missed heartbeat response: expected " << last_heartbeat_seq_
+                              << ", got " << sequence << std::endl;
+                }
+                break;
         }
     }
 
@@ -186,19 +224,19 @@ class server {
 public:
     using session_id_type = session_id_type;
 
+    struct SessionStats {
+        int active_sessions;
+        double avg_session_time;
+    };
+
     server(boost::asio::io_context& io_context, short port,
-           std::time_t max_idle_time_seconds = 300,
-           std::chrono::seconds heartbeat_interval = std::chrono::seconds(10),
-           std::chrono::seconds heartbeat_timeout = std::chrono::seconds(5))
+           std::time_t max_idle_time_seconds = 300)
         : io_context_(io_context),
           acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
           max_idle_time_seconds_(max_idle_time_seconds),
-          heartbeat_interval_(heartbeat_interval),
-          heartbeat_timeout_(heartbeat_timeout),
           sequence_generator_(1) {
         start_accept();
         start_expiration_timer();
-        start_heartbeat_timer();
     }
 
     void send_request_to_session(session_id_type session_id,
@@ -273,17 +311,6 @@ public:
         }
     }
 
-    void send_response_to_session(session_id_type session_id,
-                                  uint8_t response_type,
-                                  uint8_t status,
-                                  uint32_t sequence,
-                                  const std::vector<uint8_t>& payload) {
-        auto session = get_session(session_id);
-        if (session) {
-            session->send_packet(response_type, status, sequence, payload);
-        }
-    }
-
     session_id_type generate_session_id() {
         static std::atomic<session_id_type> id_counter(1);
         return id_counter++;
@@ -316,17 +343,32 @@ public:
 
     void remove_session(session_id_type id) {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
-        sessions_.erase(id);
-        session_metadata_.erase(id);
+        auto it = sessions_.find(id);
+        if (it != sessions_.end()) {
+            auto session = it->second.lock();
+            if (session) {
+                session->graceful_close();
+            }
+            sessions_.erase(it);
+        }
+
+        auto meta_it = session_metadata_.find(id);
+        if (meta_it != session_metadata_.end()) {
+            auto start_time = session_start_times_.find(id);
+            if (start_time != session_start_times_.end()) {
+                total_session_time_ += std::difftime(std::time(nullptr), start_time->second);
+                session_start_times_.erase(start_time);
+            }
+            session_metadata_.erase(meta_it);
+        }
+
+        active_sessions_count_--;
     }
 
-    std::optional<SessionMetadata> get_session_metadata(session_id_type id) const {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        auto it = session_metadata_.find(id);
-        if (it != session_metadata_.end()) {
-            return it->second;
-        }
-        return std::nullopt;
+    SessionStats get_statistics() const {
+        int active = active_sessions_count_.load();
+        double total = total_session_time_.load();
+        return {active, active ? total / active : 0.0};
     }
 
 private:
@@ -334,6 +376,7 @@ private:
     tcp::acceptor acceptor_;
     std::map<session_id_type, boost::weak_ptr<session>> sessions_;
     std::map<session_id_type, SessionMetadata> session_metadata_;
+    std::map<session_id_type, std::time_t> session_start_times_;
     std::mutex sessions_mutex_;
 
     std::atomic<uint32_t> sequence_generator_;
@@ -341,10 +384,8 @@ private:
     std::mutex pending_requests_mutex_;
 
     std::time_t max_idle_time_seconds_;
-    std::chrono::seconds heartbeat_interval_;
-    std::chrono::seconds heartbeat_timeout_;
-    std::shared_ptr<boost::asio::steady_timer> expiration_timer_;
-    std::shared_ptr<boost::asio::steady_timer> heartbeat_timer_;
+    std::atomic<int> active_sessions_count_{0};
+    std::atomic<double> total_session_time_{0.0};
 
     void start_accept() {
         auto socket = std::make_shared<tcp::socket>(acceptor_.get_executor());
@@ -368,6 +409,8 @@ private:
                     std::lock_guard<std::mutex> lock(sessions_mutex_);
                     sessions_[session_id] = new_session;
                     session_metadata_[session_id] = metadata;
+                    session_start_times_[session_id] = metadata.connection_time;
+                    active_sessions_count_++;
                 }
 
                 new_session->start();
@@ -391,39 +434,16 @@ private:
         for (auto it = session_metadata_.begin(); it != session_metadata_.end(); ) {
             if (now - it->second.last_active_time > max_idle_time_seconds_) {
                 sessions_.erase(it->first);
+                auto start_time = session_start_times_.find(it->first);
+                if (start_time != session_start_times_.end()) {
+                    total_session_time_ += std::difftime(now, start_time->second);
+                    session_start_times_.erase(start_time);
+                }
                 it = session_metadata_.erase(it);
+                active_sessions_count_--;
             } else {
                 ++it;
             }
-        }
-    }
-
-    void start_heartbeat_timer() {
-        heartbeat_timer_ = std::make_shared<boost::asio::steady_timer>(io_context_);
-        heartbeat_timer_->expires_after(heartbeat_interval_);
-        heartbeat_timer_->async_wait([this](const boost::system::error_code&) {
-            send_heartbeats();
-            start_heartbeat_timer();
-        });
-    }
-
-    void send_heartbeats() {
-        std::vector<uint8_t> empty_payload;
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        for (const auto& pair : sessions_) {
-            session_id_type id = pair.first;
-            send_request_to_session(
-                id,
-                PKT_HEARTBEAT_REQ,
-                empty_payload,
-                [this, id](const std::vector<uint8_t>&, uint8_t status) {
-                    if (status == PKT_TIMEOUT_STATUS) {
-                        remove_session(id);
-                    }
-                },
-                PKT_HEARTBEAT_RESP,
-                heartbeat_timeout_
-            );
         }
     }
 
@@ -435,6 +455,8 @@ private:
         }
         return nullptr;
     }
+
+    std::shared_ptr<boost::asio::steady_timer> expiration_timer_;
 };
 
 int main(int argc, char* argv[]) {
@@ -446,8 +468,7 @@ int main(int argc, char* argv[]) {
 
         boost::asio::io_context io_context;
         auto server_instance = std::make_shared<server>(
-            io_context, std::atoi(argv[1]), 300,
-            std::chrono::seconds(10), std::chrono::seconds(5));
+            io_context, std::atoi(argv[1]), 300);
 
         const int num_threads = 4;
         std::vector<std::thread> threads;
@@ -455,6 +476,13 @@ int main(int argc, char* argv[]) {
             threads.emplace_back([&io_context]() {
                 io_context.run();
             });
+        }
+
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            auto stats = server_instance->get_statistics();
+            std::cout << "Active Sessions: " << stats.active_sessions << "\n"
+                      << "Avg Session Time: " << stats.avg_session_time << "s\n";
         }
 
         for (auto& t : threads) {
