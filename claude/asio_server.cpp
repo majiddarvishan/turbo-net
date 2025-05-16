@@ -8,18 +8,86 @@
 #include <functional>
 #include <atomic>
 #include <asio.hpp>
+#include <cstring>
+#include <deque>
 
 // Constants
 constexpr int DEFAULT_PORT = 8080;
-constexpr int MAX_BUFFER_SIZE = 4096;
+constexpr int MAX_BUFFER_SIZE = 16384; // Larger buffer to accommodate packets
 constexpr int DEFAULT_THREAD_POOL_SIZE = 4;
 
+// Packet header structure (10 bytes total)
+struct PacketHeader {
+    uint32_t length;   // 4 bytes: total packet length including header
+    uint8_t  packetId; // 1 byte: packet type ID
+    uint8_t  status;   // 1 byte: status code
+    uint32_t sequence; // 4 bytes: sequence number
+
+    // Packet type constants
+    static constexpr uint8_t BIND = 0x01;
+    static constexpr uint8_t BIND_RESP = 0x81;
+    static constexpr uint8_t REQUEST = 0x02;
+    static constexpr uint8_t RESPONSE = 0x82;
+
+    // Convert header to network byte order for sending
+    void toNetworkByteOrder() {
+        length = htonl(length);
+        sequence = htonl(sequence);
+    }
+
+    // Convert header from network to host byte order after receiving
+    void toHostByteOrder() {
+        length = ntohl(length);
+        sequence = ntohl(sequence);
+    }
+};
+
 // Forward declarations
-class Connection;
 class TcpServer;
 
+// Define a Packet structure to include header and payload
+struct Packet {
+    PacketHeader header;
+    std::vector<uint8_t> payload;
+
+    static Packet createPacket(uint8_t packetId, uint8_t status, uint32_t sequence,
+                              const std::vector<uint8_t>& payload) {
+        Packet packet;
+        packet.header.length = sizeof(PacketHeader) + payload.size();
+        packet.header.packetId = packetId;
+        packet.header.status = status;
+        packet.header.sequence = sequence;
+        packet.payload = payload;
+        return packet;
+    }
+
+    // Convert string data to packet payload
+    static Packet createPacket(uint8_t packetId, uint8_t status, uint32_t sequence,
+                              const std::string& data) {
+        std::vector<uint8_t> payload(data.begin(), data.end());
+        return createPacket(packetId, status, sequence, payload);
+    }
+
+    // Serialize packet to binary format for sending
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> buffer(sizeof(PacketHeader) + payload.size());
+
+        // Copy header with network byte order
+        PacketHeader networkHeader = header;
+        networkHeader.toNetworkByteOrder();
+        std::memcpy(buffer.data(), &networkHeader, sizeof(PacketHeader));
+
+        // Copy payload
+        if (!payload.empty()) {
+            std::memcpy(buffer.data() + sizeof(PacketHeader), payload.data(), payload.size());
+        }
+
+        return buffer;
+    }
+};
+
 // Callback types
-using DataReceivedCallback = std::function<void(int connectionId, const std::string& data)>;
+using PacketReceivedCallback = std::function<void(int connectionId, const Packet& packet)>;
 using ConnectionClosedCallback = std::function<void(int connectionId)>;
 
 // Connection class to handle individual client connections
@@ -43,22 +111,29 @@ public:
     }
 
     // Start reading from the connection
-    void start(const DataReceivedCallback& dataCallback,
+    void start(const PacketReceivedCallback& packetCallback,
                const ConnectionClosedCallback& closedCallback);
 
-    // Send data to this connection
-    void sendData(const std::string& message) {
+    // Send a packet to this connection
+    void sendPacket(const Packet& packet) {
         auto self = shared_from_this();
+        auto serialized = packet.serialize();
 
         // Use strand to ensure thread safety for write operations
-        asio::post(strand_, [self, message]() {
+        asio::post(strand_, [self, serialized]() {
             bool write_in_progress = !self->write_queue_.empty();
-            self->write_queue_.push_back(message);
+            self->write_queue_.push_back(serialized);
 
             if (!write_in_progress) {
                 self->doWrite();
             }
         });
+    }
+
+    // Send data with specific packet type
+    void sendData(uint8_t packetId, uint8_t status, uint32_t sequence, const std::string& data) {
+        auto packet = Packet::createPacket(packetId, status, sequence, data);
+        sendPacket(packet);
     }
 
     // Close the connection
@@ -79,22 +154,46 @@ private:
         : socket_(io_context),
           strand_(asio::make_strand(io_context)),
           server_(server),
-          id_(id) {}
+          id_(id),
+          read_state_(ReadState::HEADER),
+          header_bytes_read_(0),
+          payload_bytes_read_(0),
+          current_payload_size_(0) {}
 
-    // Read data asynchronously
-    void doRead();
+    // Read header asynchronously
+    void readHeader();
+
+    // Read payload asynchronously
+    void readPayload();
+
+    // Process a complete packet
+    void processPacket();
 
     // Write data asynchronously
     void doWrite();
+
+    // Enum for the connection read state
+    enum class ReadState {
+        HEADER,
+        PAYLOAD
+    };
 
     asio::ip::tcp::socket socket_;
     asio::strand<asio::io_context::executor_type> strand_;
     TcpServer& server_;
     int id_;
-    std::array<char, MAX_BUFFER_SIZE> buffer_;
-    std::vector<std::string> write_queue_;
-    DataReceivedCallback dataCallback_;
+    std::deque<std::vector<uint8_t>> write_queue_;
+    PacketReceivedCallback packetCallback_;
     ConnectionClosedCallback closedCallback_;
+
+    // Reading state variables
+    ReadState read_state_;
+    size_t header_bytes_read_;
+    size_t payload_bytes_read_;
+    size_t current_payload_size_;
+    PacketHeader current_header_;
+    std::vector<uint8_t> current_payload_;
+    std::array<uint8_t, sizeof(PacketHeader)> header_buffer_;
 };
 
 // Main TCP Server class
@@ -105,6 +204,7 @@ public:
           acceptor_(io_context_, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)),
           port_(port),
           nextConnectionId_(1),
+          nextSequence_(1),
           thread_pool_size_(numThreads) {
     }
 
@@ -131,28 +231,47 @@ public:
     }
 
     // Set callbacks
-    void setCallbacks(DataReceivedCallback dataCallback, ConnectionClosedCallback closedCallback) {
-        dataCallback_ = std::move(dataCallback);
+    void setCallbacks(PacketReceivedCallback packetCallback, ConnectionClosedCallback closedCallback) {
+        packetCallback_ = std::move(packetCallback);
         closedCallback_ = std::move(closedCallback);
     }
 
-    // Send data to a specific connection
-    bool sendTo(int connectionId, const std::string& message) {
+    // Get next sequence number
+    uint32_t getNextSequence() {
+        return nextSequence_++;
+    }
+
+    // Send a packet to a specific connection
+    bool sendPacketTo(int connectionId, const Packet& packet) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = connections_.find(connectionId);
         if (it != connections_.end()) {
-            it->second->sendData(message);
+            it->second->sendPacket(packet);
             return true;
         }
         return false;
     }
 
-    // Send data to all connections
-    void broadcast(const std::string& message) {
+    // Send data to a specific connection with auto-generated sequence
+    bool sendTo(int connectionId, uint8_t packetId, uint8_t status, const std::string& data) {
+        uint32_t sequence = getNextSequence();
+        auto packet = Packet::createPacket(packetId, status, sequence, data);
+        return sendPacketTo(connectionId, packet);
+    }
+
+    // Broadcast a packet to all connections
+    void broadcastPacket(const Packet& packet) {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& [id, connection] : connections_) {
-            connection->sendData(message);
+            connection->sendPacket(packet);
         }
+    }
+
+    // Broadcast data to all connections with auto-generated sequence
+    void broadcast(uint8_t packetId, uint8_t status, const std::string& data) {
+        uint32_t sequence = getNextSequence();
+        auto packet = Packet::createPacket(packetId, status, sequence, data);
+        broadcastPacket(packet);
     }
 
     // Get number of active connections
@@ -228,7 +347,7 @@ private:
                 if (!ec) {
                     // Register and start the connection
                     registerConnection(newConnection);
-                    newConnection->start(dataCallback_, closedCallback_);
+                    newConnection->start(packetCallback_, closedCallback_);
                 } else {
                     std::cerr << "Error accepting connection: " << ec.message() << std::endl;
                 }
@@ -245,19 +364,20 @@ private:
     std::unique_ptr<asio::executor_work_guard<asio::io_context::executor_type>> work_guard_;
     int port_;
     std::atomic<int> nextConnectionId_;
+    std::atomic<uint32_t> nextSequence_;
     int thread_pool_size_;
     std::unordered_map<int, std::shared_ptr<Connection>> connections_;
     mutable std::mutex mutex_;
     std::vector<std::thread> threads_;
 
-    DataReceivedCallback dataCallback_;
+    PacketReceivedCallback packetCallback_;
     ConnectionClosedCallback closedCallback_;
 };
 
 // Implementation of Connection::start
-void Connection::start(const DataReceivedCallback& dataCallback,
+void Connection::start(const PacketReceivedCallback& packetCallback,
                        const ConnectionClosedCallback& closedCallback) {
-    dataCallback_ = dataCallback;
+    packetCallback_ = packetCallback;
     closedCallback_ = closedCallback;
 
     // Get client address info
@@ -270,38 +390,129 @@ void Connection::start(const DataReceivedCallback& dataCallback,
         std::cerr << "Error getting remote endpoint: " << e.what() << std::endl;
     }
 
-    // Send welcome message
-    sendData("Welcome to the high performance Asio TCP server!\n");
+    // Send welcome message as a BIND_RESP packet
+    std::string welcomeMsg = "Welcome to the high performance Asio TCP server!";
+    sendData(PacketHeader::BIND_RESP, 0, server_.getNextSequence(), welcomeMsg);
 
-    // Start reading data
-    doRead();
+    // Start reading header
+    readHeader();
 }
 
-// Implementation of Connection::doRead
-void Connection::doRead() {
+// Implementation of Connection::readHeader
+void Connection::readHeader() {
     auto self = shared_from_this();
 
-    socket_.async_read_some(asio::buffer(buffer_),
+    asio::async_read(socket_,
+        asio::buffer(header_buffer_.data() + header_bytes_read_,
+                    sizeof(PacketHeader) - header_bytes_read_),
         asio::bind_executor(strand_,
-            [this, self](const asio::error_code& ec, std::size_t length) {
+            [this, self](const asio::error_code& ec, std::size_t bytes_transferred) {
                 if (!ec) {
-                    // Process the received data
-                    std::string data(buffer_.data(), length);
+                    header_bytes_read_ += bytes_transferred;
 
-                    // Call the data received callback
-                    if (dataCallback_) {
-                        dataCallback_(id_, data);
-                    }
+                    if (header_bytes_read_ == sizeof(PacketHeader)) {
+                        // We've read the complete header
+                        std::memcpy(&current_header_, header_buffer_.data(), sizeof(PacketHeader));
+                        current_header_.toHostByteOrder();
 
-                    // Continue reading
-                    doRead();
-                } else {
-                    // Handle errors
-                    if (ec != asio::error::operation_aborted) {
-                        server_.unregisterConnection(id_);
+                        // Validate header
+                        if (current_header_.length < sizeof(PacketHeader) ||
+                            current_header_.length > MAX_BUFFER_SIZE) {
+                            std::cerr << "Invalid packet length: " << current_header_.length << std::endl;
+                            close();
+                            return;
+                        }
+
+                        // Calculate payload size
+                        current_payload_size_ = current_header_.length - sizeof(PacketHeader);
+
+                        if (current_payload_size_ > 0) {
+                            // Prepare for payload
+                            current_payload_.resize(current_payload_size_);
+                            payload_bytes_read_ = 0;
+                            read_state_ = ReadState::PAYLOAD;
+
+                            // Start reading payload
+                            readPayload();
+                        } else {
+                            // No payload, process the packet now
+                            processPacket();
+
+                            // Reset for next header
+                            header_bytes_read_ = 0;
+                            read_state_ = ReadState::HEADER;
+                            readHeader();
+                        }
+                    } else {
+                        // Continue reading header
+                        readHeader();
                     }
+                } else if (ec != asio::error::operation_aborted) {
+                    // Handle read error
+                    std::cerr << "Header read error: " << ec.message() << std::endl;
+                    server_.unregisterConnection(id_);
                 }
             }));
+}
+
+// Implementation of Connection::readPayload
+void Connection::readPayload() {
+    auto self = shared_from_this();
+
+    asio::async_read(socket_,
+        asio::buffer(current_payload_.data() + payload_bytes_read_,
+                    current_payload_size_ - payload_bytes_read_),
+        asio::bind_executor(strand_,
+            [this, self](const asio::error_code& ec, std::size_t bytes_transferred) {
+                if (!ec) {
+                    payload_bytes_read_ += bytes_transferred;
+
+                    if (payload_bytes_read_ == current_payload_size_) {
+                        // Complete packet received, process it
+                        processPacket();
+
+                        // Reset for next header
+                        header_bytes_read_ = 0;
+                        read_state_ = ReadState::HEADER;
+                        readHeader();
+                    } else {
+                        // Continue reading payload
+                        readPayload();
+                    }
+                } else if (ec != asio::error::operation_aborted) {
+                    // Handle read error
+                    std::cerr << "Payload read error: " << ec.message() << std::endl;
+                    server_.unregisterConnection(id_);
+                }
+            }));
+}
+
+// Implementation of Connection::processPacket
+void Connection::processPacket() {
+    // Create complete packet
+    Packet packet;
+    packet.header = current_header_;
+    packet.payload = current_payload_;
+
+    // Call the packet received callback
+    if (packetCallback_) {
+        packetCallback_(id_, packet);
+    }
+
+    // Handle specific packet types automatically
+    switch (packet.header.packetId) {
+        case PacketHeader::BIND:
+            // Auto-respond to BIND with BIND_RESP
+            sendData(PacketHeader::BIND_RESP, 0, packet.header.sequence, "Bind successful");
+            break;
+
+        case PacketHeader::REQUEST:
+            // For demonstration, echo back the request with RESPONSE
+            // In a real application, you'd process the request and generate a proper response
+            sendData(PacketHeader::RESPONSE, 0, packet.header.sequence,
+                    std::string(packet.payload.begin(), packet.payload.end()));
+            break;
+    }
 }
 
 // Implementation of Connection::doWrite
@@ -317,12 +528,22 @@ void Connection::doWrite() {
                     if (!write_queue_.empty()) {
                         doWrite();
                     }
-                } else {
-                    if (ec != asio::error::operation_aborted) {
-                        server_.unregisterConnection(id_);
-                    }
+                } else if (ec != asio::error::operation_aborted) {
+                    std::cerr << "Write error: " << ec.message() << std::endl;
+                    server_.unregisterConnection(id_);
                 }
             }));
+}
+
+// Utility function to print packet information
+std::string packetTypeToString(uint8_t packetId) {
+    switch (packetId) {
+        case PacketHeader::BIND: return "BIND";
+        case PacketHeader::BIND_RESP: return "BIND_RESP";
+        case PacketHeader::REQUEST: return "REQUEST";
+        case PacketHeader::RESPONSE: return "RESPONSE";
+        default: return "UNKNOWN";
+    }
 }
 
 // Example usage
@@ -333,14 +554,19 @@ int main() {
 
         // Set callbacks
         server.setCallbacks(
-            // Data received callback
-            [](int connectionId, const std::string& data) {
-                std::cout << "Received from [" << connectionId << "]: " << data;
+            // Packet received callback
+            [](int connectionId, const Packet& packet) {
+                std::cout << "Received packet from [" << connectionId << "]: "
+                          << "Type=" << packetTypeToString(packet.header.packetId)
+                          << ", Status=" << static_cast<int>(packet.header.status)
+                          << ", Seq=" << packet.header.sequence
+                          << ", Length=" << packet.header.length << std::endl;
 
-                // Echo back
-                std::string response = "Echo from server: " + data;
-                // Note: In a real application, you might want to call server.sendTo() here
-                // But in this example, we handle it in the main loop below
+                // If packet has payload, print it as text
+                if (!packet.payload.empty()) {
+                    std::string text(packet.payload.begin(), packet.payload.end());
+                    std::cout << "  Payload: " << text << std::endl;
+                }
             },
 
             // Connection closed callback
@@ -357,8 +583,8 @@ int main() {
             int counter = 0;
             while (true) {
                 std::this_thread::sleep_for(std::chrono::seconds(5));
-                std::string msg = "Server heartbeat: " + std::to_string(counter++) + "\n";
-                server.broadcast(msg);
+                std::string msg = "Server heartbeat: " + std::to_string(counter++);
+                server.broadcast(PacketHeader::RESPONSE, 0, msg);
             }
         });
 
@@ -376,33 +602,82 @@ int main() {
                 std::cout << "Active connections: " << server.connectionCount() << std::endl;
             } else if (cmd == "help") {
                 std::cout << "Available commands:" << std::endl
-                          << "  send <id> <message> - Send message to specific client" << std::endl
-                          << "  broadcast <message> - Send message to all clients" << std::endl
-                          << "  close <id>          - Close a specific connection" << std::endl
-                          << "  count               - Show number of active connections" << std::endl
-                          << "  quit                - Stop server and exit" << std::endl;
+                          << "  send <id> <type> <msg> - Send message to specific client" << std::endl
+                          << "                           Type: bind, bind_resp, req, resp" << std::endl
+                          << "  broadcast <type> <msg> - Send message to all clients" << std::endl
+                          << "  close <id>            - Close a specific connection" << std::endl
+                          << "  count                 - Show number of active connections" << std::endl
+                          << "  quit                  - Stop server and exit" << std::endl;
             } else if (cmd.substr(0, 4) == "send" && cmd.length() > 4) {
-                size_t pos = cmd.find(" ", 5);
-                if (pos != std::string::npos) {
-                    try {
-                        int id = std::stoi(cmd.substr(5, pos - 5));
-                        std::string message = cmd.substr(pos + 1) + "\n";
+                // Parse command: send <id> <type> <message>
+                std::istringstream iss(cmd.substr(5));
+                std::string idStr, typeStr, message;
 
-                        if (server.sendTo(id, message)) {
-                            std::cout << "Message sent to connection " << id << std::endl;
-                        } else {
-                            std::cout << "Connection " << id << " not found" << std::endl;
+                if (iss >> idStr >> typeStr) {
+                    // Get the rest as message
+                    std::getline(iss >> std::ws, message);
+
+                    if (!message.empty()) {
+                        try {
+                            int id = std::stoi(idStr);
+                            uint8_t packetId = PacketHeader::RESPONSE; // Default
+
+                            // Parse packet type
+                            if (typeStr == "bind") packetId = PacketHeader::BIND;
+                            else if (typeStr == "bind_resp") packetId = PacketHeader::BIND_RESP;
+                            else if (typeStr == "req") packetId = PacketHeader::REQUEST;
+                            else if (typeStr == "resp") packetId = PacketHeader::RESPONSE;
+                            else {
+                                std::cout << "Invalid packet type. Use: bind, bind_resp, req, resp" << std::endl;
+                                continue;
+                            }
+
+                            if (server.sendTo(id, packetId, 0, message)) {
+                                std::cout << "Sent " << packetTypeToString(packetId)
+                                          << " packet to connection " << id << std::endl;
+                            } else {
+                                std::cout << "Connection " << id << " not found" << std::endl;
+                            }
+                        } catch (const std::exception& e) {
+                            std::cout << "Invalid command format. Use: send <id> <type> <message>" << std::endl;
                         }
-                    } catch (const std::exception& e) {
-                        std::cout << "Invalid command format. Use: send <id> <message>" << std::endl;
+                    } else {
+                        std::cout << "Message cannot be empty" << std::endl;
                     }
                 } else {
-                    std::cout << "Invalid command format. Use: send <id> <message>" << std::endl;
+                    std::cout << "Invalid command format. Use: send <id> <type> <message>" << std::endl;
                 }
-            } else if (cmd.substr(0, 9) == "broadcast" && cmd.length() > 10) {
-                std::string message = cmd.substr(10) + "\n";
-                server.broadcast(message);
-                std::cout << "Message broadcasted to all connections" << std::endl;
+            } else if (cmd.substr(0, 9) == "broadcast" && cmd.length() > 9) {
+                // Parse command: broadcast <type> <message>
+                std::istringstream iss(cmd.substr(10));
+                std::string typeStr, message;
+
+                if (iss >> typeStr) {
+                    // Get the rest as message
+                    std::getline(iss >> std::ws, message);
+
+                    if (!message.empty()) {
+                        uint8_t packetId = PacketHeader::RESPONSE; // Default
+
+                        // Parse packet type
+                        if (typeStr == "bind") packetId = PacketHeader::BIND;
+                        else if (typeStr == "bind_resp") packetId = PacketHeader::BIND_RESP;
+                        else if (typeStr == "req") packetId = PacketHeader::REQUEST;
+                        else if (typeStr == "resp") packetId = PacketHeader::RESPONSE;
+                        else {
+                            std::cout << "Invalid packet type. Use: bind, bind_resp, req, resp" << std::endl;
+                            continue;
+                        }
+
+                        server.broadcast(packetId, 0, message);
+                        std::cout << "Broadcasted " << packetTypeToString(packetId)
+                                  << " packet to all connections" << std::endl;
+                    } else {
+                        std::cout << "Message cannot be empty" << std::endl;
+                    }
+                } else {
+                    std::cout << "Invalid command format. Use: broadcast <type> <message>" << std::endl;
+                }
             } else if (cmd.substr(0, 5) == "close" && cmd.length() > 6) {
                 try {
                     int id = std::stoi(cmd.substr(6));
