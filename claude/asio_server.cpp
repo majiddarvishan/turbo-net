@@ -10,6 +10,8 @@
 #include <asio.hpp>
 #include <cstring>
 #include <deque>
+#include <chrono>
+#include <map>
 
 // Constants
 constexpr int DEFAULT_PORT = 8080;
@@ -89,6 +91,14 @@ struct Packet {
 // Callback types
 using PacketReceivedCallback = std::function<void(int connectionId, const Packet& packet)>;
 using ConnectionClosedCallback = std::function<void(int connectionId)>;
+using ResponseTimeoutCallback = std::function<void(uint32_t sequenceNumber)>;
+using ResponseCallback = std::function<void(int connectionId, const Packet& packet)>;
+
+struct PendingRequest {
+    std::chrono::steady_clock::time_point expiryTime;
+    int connectionId;
+    ResponseCallback callback;
+};
 
 // Forward declaration for TcpServer class
 class TcpServer {
@@ -120,6 +130,19 @@ public:
     void registerConnection(const std::shared_ptr<class Connection>& connection);
     void unregisterConnection(int connectionId);
 
+     uint32_t sendRequest(int connectionId, const std::string& data,
+                         std::chrono::milliseconds timeout,
+                         ResponseCallback responseCallback,
+                         ResponseTimeoutCallback timeoutCallback = nullptr);
+
+    // Set global timeout callback
+    void setTimeoutCallback(ResponseTimeoutCallback callback) {
+        timeoutCallback_ = std::move(callback);
+    }
+
+    // Cancel a pending request
+    bool cancelRequest(uint32_t sequenceNumber);
+
 private:
     void startAccept();
 
@@ -137,10 +160,18 @@ private:
 
     PacketReceivedCallback packetCallback_;
     ConnectionClosedCallback closedCallback_;
+
+    // Request tracking
+    std::map<uint32_t, PendingRequest> pendingRequests_;
+    std::mutex requestsMutex_;
+    asio::steady_timer timeoutTimer_;
+    bool timeoutTimerRunning_ = false;
+    ResponseTimeoutCallback timeoutCallback_;
 };
 
 // Connection class to handle individual client connections
-class Connection : public std::enable_shared_from_this<Connection> {
+class Connection : public std::enable_shared_from_this<Connection>
+{
 public:
     using Pointer = std::shared_ptr<Connection>;
 
@@ -235,7 +266,150 @@ TcpServer::TcpServer(int port, int numThreads, const std::string& serverId)
       nextConnectionId_(1),
       nextSequence_(1),
       thread_pool_size_(numThreads),
-      server_id_(serverId) {
+      server_id_(serverId),
+      timeoutTimer_(io_context_) {
+
+}
+
+uint32_t TcpServer::sendRequest(int connectionId, const std::string& data,
+                              std::chrono::milliseconds timeout,
+                              ResponseCallback responseCallback,
+                              ResponseTimeoutCallback timeoutCallback) {
+    // Generate a new sequence number for this request
+    uint32_t sequence = getNextSequence();
+
+    // Create and send the packet
+    auto packet = Packet::createPacket(PacketHeader::REQUEST, 0, sequence, data);
+    if (!sendPacketTo(connectionId, packet)) {
+        // Connection not found, return 0 to indicate failure
+        return 0;
+    }
+
+    // Calculate expiry time
+    auto expiryTime = std::chrono::steady_clock::now() + timeout;
+
+    // Create a pending request entry
+    PendingRequest request{
+        expiryTime,
+        connectionId,
+        std::move(responseCallback)
+    };
+
+    // Register the pending request with its timeout
+    {
+        std::lock_guard<std::mutex> lock(requestsMutex_);
+        pendingRequests_[sequence] = std::move(request);
+
+        // Set the timeoutCallback if provided
+        if (timeoutCallback) {
+            timeoutCallback_ = std::move(timeoutCallback);
+        }
+    }
+
+    // Schedule timeout checking if not already running
+    if (!timeoutTimerRunning_) {
+        std::lock_guard<std::mutex> lock(requestsMutex_);
+
+        if (!timeoutTimerRunning_) {
+            timeoutTimerRunning_ = true;
+            timeoutTimer_.expires_after(std::chrono::milliseconds(100));  // Check every 100ms
+            timeoutTimer_.async_wait([this](const asio::error_code& error) {
+                checkTimeouts(error);
+            });
+        }
+    }
+
+    return sequence;
+}
+
+// Add method to check for timeouts
+void TcpServer::checkTimeouts(const asio::error_code& error) {
+    if (error) {
+        // Timer was cancelled or errored
+        std::lock_guard<std::mutex> lock(requestsMutex_);
+        timeoutTimerRunning_ = false;
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    bool hasPending = false;
+
+    {
+        std::lock_guard<std::mutex> lock(requestsMutex_);
+
+        // Use a separate vector to store expired sequence numbers to avoid
+        // iterator invalidation when erasing from the map
+        std::vector<uint32_t> expiredSequences;
+
+        for (const auto& [sequence, request] : pendingRequests_) {
+            if (now >= request.expiryTime) {
+                expiredSequences.push_back(sequence);
+            }
+        }
+
+        // Handle all expired requests
+        for (uint32_t sequence : expiredSequences) {
+            if (timeoutCallback_) {
+                // Call the timeout callback
+                timeoutCallback_(sequence);
+            }
+
+            // Remove the request
+            pendingRequests_.erase(sequence);
+        }
+
+        // Check if we have any remaining pending requests
+        hasPending = !pendingRequests_.empty();
+    }
+
+    // Reschedule the timer if we still have pending requests
+    if (hasPending) {
+        timeoutTimer_.expires_after(std::chrono::milliseconds(100));
+        timeoutTimer_.async_wait([this](const asio::error_code& error) {
+            checkTimeouts(error);
+        });
+    } else {
+        std::lock_guard<std::mutex> lock(requestsMutex_);
+        timeoutTimerRunning_ = false;
+    }
+}
+
+// Add method to cancel a pending request
+bool TcpServer::cancelRequest(uint32_t sequenceNumber) {
+    std::lock_guard<std::mutex> lock(requestsMutex_);
+    return pendingRequests_.erase(sequenceNumber) > 0;
+}
+
+// Add method to handle incoming responses
+void TcpServer::handleIncomingPacket(int connectionId, const Packet& packet) {
+    // Check if this is a response packet
+    if (packet.header.packetId == PacketHeader::RESPONSE) {
+        // Check if we have a pending request for this sequence number
+        ResponseCallback callback;
+
+        {
+            std::lock_guard<std::mutex> lock(requestsMutex_);
+            auto it = pendingRequests_.find(packet.header.sequence);
+
+            if (it != pendingRequests_.end()) {
+                // Get the callback before erasing
+                callback = it->second.callback;
+
+                // Remove the request from pending
+                pendingRequests_.erase(it);
+            }
+        }
+
+        // Call the callback if found
+        if (callback) {
+            callback(connectionId, packet);
+        }
+    }
+
+    // Always call the global packet callback if set
+    if (packetCallback_) {
+        packetCallback_(connectionId, packet);
+    }
 }
 
 void TcpServer::start() {
@@ -246,6 +420,19 @@ void TcpServer::start() {
     // Create work guard to keep io_context running
     work_guard_ = std::make_unique<asio::executor_work_guard<asio::io_context::executor_type>>(
         asio::make_work_guard(io_context_));
+
+    // Create a shared_ptr to 'this' for use in the connection callbacks
+    auto self = shared_from_this();
+
+    // Set up the connection callbacks
+    setCallbacks(
+        // Packet received callback - redirect through handleIncomingPacket
+        [self](int connectionId, const Packet& packet) {
+            self->handleIncomingPacket(connectionId, packet);
+        },
+        // Connection closed callback - use the existing callback
+        closedCallback_
+    );
 
     // Start accepting connections
     startAccept();
@@ -594,6 +781,10 @@ int main() {
         // Create and configure server with custom ID
         TcpServer server(8080, DEFAULT_THREAD_POOL_SIZE, "SERVER_MAIN_001");
 
+        server->setTimeoutCallback([](uint32_t sequence) {
+             std::cout << "Request with sequence " << sequence << " timed out" << std::endl;
+        });
+
         // Set callbacks
         server.setCallbacks(
             // Packet received callback
@@ -629,6 +820,35 @@ int main() {
                 server.broadcast(PacketHeader::RESPONSE, 0, msg);
             }
         });
+
+         // Send request with 5 second timeout
+    uint32_t sequence = server->sendRequest(
+        clientId,
+        requestData,
+        std::chrono::seconds(5),
+        // Response callback
+        [](int connectionId, const Packet& packet) {
+            std::cout << "Received response from client " << connectionId
+                      << " for sequence " << packet.header.sequence << std::endl;
+
+            // Process the response data
+            if (!packet.payload.empty()) {
+                std::string responseText(packet.payload.begin(), packet.payload.end());
+                std::cout << "Response content: " << responseText << std::endl;
+            }
+        }
+    );
+
+    if (sequence > 0) {
+        std::cout << "Request sent with sequence " << sequence << std::endl;
+    } else {
+        std::cout << "Failed to send request - client not found" << std::endl;
+    }
+
+     // Later, you can cancel the request if needed
+    if (server->cancelRequest(sequence)) {
+        std::cout << "Cancelled request with sequence " << sequence << std::endl;
+    }
 
         // Main application loop
         std::string cmd;
