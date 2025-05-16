@@ -90,6 +90,55 @@ struct Packet {
 using PacketReceivedCallback = std::function<void(int connectionId, const Packet& packet)>;
 using ConnectionClosedCallback = std::function<void(int connectionId)>;
 
+// Forward declaration for TcpServer class
+class TcpServer {
+public:
+    TcpServer(int port = DEFAULT_PORT, int numThreads = DEFAULT_THREAD_POOL_SIZE,
+              const std::string& serverId = "SERVER_DEFAULT");
+
+    // Get server ID
+    const std::string& getServerId() const {
+        return server_id_;
+    }
+
+    // Set server ID
+    void setServerId(const std::string& serverId) {
+        server_id_ = serverId;
+    }
+
+    void start();
+    void setCallbacks(PacketReceivedCallback packetCallback, ConnectionClosedCallback closedCallback);
+    uint32_t getNextSequence();
+    bool sendPacketTo(int connectionId, const Packet& packet);
+    bool sendTo(int connectionId, uint8_t packetId, uint8_t status, const std::string& data);
+    void broadcastPacket(const Packet& packet);
+    void broadcast(uint8_t packetId, uint8_t status, const std::string& data);
+    size_t connectionCount() const;
+    std::string getClientInfo(int connectionId) const;
+    bool closeConnection(int connectionId);
+    void stop();
+    void registerConnection(const std::shared_ptr<class Connection>& connection);
+    void unregisterConnection(int connectionId);
+
+private:
+    void startAccept();
+
+    asio::io_context io_context_;
+    asio::ip::tcp::acceptor acceptor_;
+    std::unique_ptr<asio::executor_work_guard<asio::io_context::executor_type>> work_guard_;
+    int port_;
+    std::atomic<int> nextConnectionId_;
+    std::atomic<uint32_t> nextSequence_;
+    int thread_pool_size_;
+    std::string server_id_;
+    std::unordered_map<int, std::shared_ptr<class Connection>> connections_;
+    mutable std::mutex mutex_;
+    std::vector<std::thread> threads_;
+
+    PacketReceivedCallback packetCallback_;
+    ConnectionClosedCallback closedCallback_;
+};
+
 // Connection class to handle individual client connections
 class Connection : public std::enable_shared_from_this<Connection> {
 public:
@@ -110,43 +159,23 @@ public:
         return id_;
     }
 
+    // Get client ID
+    const std::string& getClientId() const {
+        return client_id_;
+    }
+
     // Start reading from the connection
     void start(const PacketReceivedCallback& packetCallback,
                const ConnectionClosedCallback& closedCallback);
 
     // Send a packet to this connection
-    void sendPacket(const Packet& packet) {
-        auto self = shared_from_this();
-        auto serialized = packet.serialize();
-
-        // Use strand to ensure thread safety for write operations
-        asio::post(strand_, [self, serialized]() {
-            bool write_in_progress = !self->write_queue_.empty();
-            self->write_queue_.push_back(serialized);
-
-            if (!write_in_progress) {
-                self->doWrite();
-            }
-        });
-    }
+    void sendPacket(const Packet& packet);
 
     // Send data with specific packet type
-    void sendData(uint8_t packetId, uint8_t status, uint32_t sequence, const std::string& data) {
-        auto packet = Packet::createPacket(packetId, status, sequence, data);
-        sendPacket(packet);
-    }
+    void sendData(uint8_t packetId, uint8_t status, uint32_t sequence, const std::string& data);
 
     // Close the connection
-    void close() {
-        // Use strand to ensure thread safety
-        asio::post(strand_, [self = shared_from_this()]() {
-            if (self->socket_.is_open()) {
-                asio::error_code ec;
-                self->socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-                self->socket_.close(ec);
-            }
-        });
-    }
+    void close();
 
 private:
     // Private constructor - use factory method instead
@@ -155,6 +184,7 @@ private:
           strand_(asio::make_strand(io_context)),
           server_(server),
           id_(id),
+          client_id_("unknown"), // Initialize client ID
           read_state_(ReadState::HEADER),
           header_bytes_read_(0),
           payload_bytes_read_(0),
@@ -182,6 +212,7 @@ private:
     asio::strand<asio::io_context::executor_type> strand_;
     TcpServer& server_;
     int id_;
+    std::string client_id_;  // Store client ID from BIND packet
     std::deque<std::vector<uint8_t>> write_queue_;
     PacketReceivedCallback packetCallback_;
     ConnectionClosedCallback closedCallback_;
@@ -196,185 +227,165 @@ private:
     std::array<uint8_t, sizeof(PacketHeader)> header_buffer_;
 };
 
-// Main TCP Server class
-class TcpServer {
-public:
-    TcpServer(int port = DEFAULT_PORT, int numThreads = DEFAULT_THREAD_POOL_SIZE)
-        : io_context_(),
-          acceptor_(io_context_, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)),
-          port_(port),
-          nextConnectionId_(1),
-          nextSequence_(1),
-          thread_pool_size_(numThreads) {
+// TcpServer implementation
+TcpServer::TcpServer(int port, int numThreads, const std::string& serverId)
+    : io_context_(),
+      acceptor_(io_context_, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)),
+      port_(port),
+      nextConnectionId_(1),
+      nextSequence_(1),
+      thread_pool_size_(numThreads),
+      server_id_(serverId) {
+}
+
+void TcpServer::start() {
+    std::cout << "Server starting on port " << port_ << " with "
+              << thread_pool_size_ << " threads..." << std::endl;
+    std::cout << "Server ID: " << server_id_ << std::endl;
+
+    // Create work guard to keep io_context running
+    work_guard_ = std::make_unique<asio::executor_work_guard<asio::io_context::executor_type>>(
+        asio::make_work_guard(io_context_));
+
+    // Start accepting connections
+    startAccept();
+
+    // Create thread pool
+    for (int i = 0; i < thread_pool_size_; ++i) {
+        threads_.emplace_back([this]() {
+            io_context_.run();
+        });
     }
 
-    // Start the server
-    void start() {
-        std::cout << "Server starting on port " << port_ << " with "
-                  << thread_pool_size_ << " threads..." << std::endl;
+    std::cout << "Server started successfully" << std::endl;
+}
 
-        // Create work guard to keep io_context running
-        work_guard_ = std::make_unique<asio::executor_work_guard<asio::io_context::executor_type>>(
-            asio::make_work_guard(io_context_));
+void TcpServer::setCallbacks(PacketReceivedCallback packetCallback, ConnectionClosedCallback closedCallback) {
+    packetCallback_ = std::move(packetCallback);
+    closedCallback_ = std::move(closedCallback);
+}
 
-        // Start accepting connections
-        startAccept();
+uint32_t TcpServer::getNextSequence() {
+    return nextSequence_++;
+}
 
-        // Create thread pool
-        for (int i = 0; i < thread_pool_size_; ++i) {
-            threads_.emplace_back([this]() {
-                io_context_.run();
-            });
-        }
-
-        std::cout << "Server started successfully" << std::endl;
+bool TcpServer::sendPacketTo(int connectionId, const Packet& packet) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = connections_.find(connectionId);
+    if (it != connections_.end()) {
+        it->second->sendPacket(packet);
+        return true;
     }
+    return false;
+}
 
-    // Set callbacks
-    void setCallbacks(PacketReceivedCallback packetCallback, ConnectionClosedCallback closedCallback) {
-        packetCallback_ = std::move(packetCallback);
-        closedCallback_ = std::move(closedCallback);
+bool TcpServer::sendTo(int connectionId, uint8_t packetId, uint8_t status, const std::string& data) {
+    uint32_t sequence = getNextSequence();
+    auto packet = Packet::createPacket(packetId, status, sequence, data);
+    return sendPacketTo(connectionId, packet);
+}
+
+void TcpServer::broadcastPacket(const Packet& packet) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& [id, connection] : connections_) {
+        connection->sendPacket(packet);
     }
+}
 
-    // Get next sequence number
-    uint32_t getNextSequence() {
-        return nextSequence_++;
+void TcpServer::broadcast(uint8_t packetId, uint8_t status, const std::string& data) {
+    uint32_t sequence = getNextSequence();
+    auto packet = Packet::createPacket(packetId, status, sequence, data);
+    broadcastPacket(packet);
+}
+
+size_t TcpServer::connectionCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return connections_.size();
+}
+
+std::string TcpServer::getClientInfo(int connectionId) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = connections_.find(connectionId);
+    if (it != connections_.end()) {
+        return it->second->getClientId();
     }
+    return "Not found";
+}
 
-    // Send a packet to a specific connection
-    bool sendPacketTo(int connectionId, const Packet& packet) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = connections_.find(connectionId);
-        if (it != connections_.end()) {
-            it->second->sendPacket(packet);
-            return true;
-        }
-        return false;
+bool TcpServer::closeConnection(int connectionId) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = connections_.find(connectionId);
+    if (it != connections_.end()) {
+        it->second->close();
+        return true;
     }
+    return false;
+}
 
-    // Send data to a specific connection with auto-generated sequence
-    bool sendTo(int connectionId, uint8_t packetId, uint8_t status, const std::string& data) {
-        uint32_t sequence = getNextSequence();
-        auto packet = Packet::createPacket(packetId, status, sequence, data);
-        return sendPacketTo(connectionId, packet);
-    }
+void TcpServer::stop() {
+    // Stop accepting new connections
+    acceptor_.close();
 
-    // Broadcast a packet to all connections
-    void broadcastPacket(const Packet& packet) {
+    // Close all connections
+    {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& [id, connection] : connections_) {
-            connection->sendPacket(packet);
+            connection->close();
+        }
+        connections_.clear();
+    }
+
+    // Stop the io_context
+    work_guard_.reset();
+
+    // Wait for all threads to complete
+    for (auto& thread : threads_) {
+        if (thread.joinable()) {
+            thread.join();
         }
     }
+    threads_.clear();
 
-    // Broadcast data to all connections with auto-generated sequence
-    void broadcast(uint8_t packetId, uint8_t status, const std::string& data) {
-        uint32_t sequence = getNextSequence();
-        auto packet = Packet::createPacket(packetId, status, sequence, data);
-        broadcastPacket(packet);
+    std::cout << "Server stopped" << std::endl;
+}
+
+void TcpServer::registerConnection(const std::shared_ptr<Connection>& connection) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    connections_[connection->getId()] = connection;
+}
+
+void TcpServer::unregisterConnection(int connectionId) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    connections_.erase(connectionId);
+
+    // Notify using the callback
+    if (closedCallback_) {
+        closedCallback_(connectionId);
     }
+}
 
-    // Get number of active connections
-    size_t connectionCount() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return connections_.size();
-    }
+void TcpServer::startAccept() {
+    int connectionId = nextConnectionId_++;
+    auto newConnection = Connection::create(io_context_, *this, connectionId);
 
-    // Close a specific connection
-    bool closeConnection(int connectionId) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = connections_.find(connectionId);
-        if (it != connections_.end()) {
-            it->second->close();
-            return true;
-        }
-        return false;
-    }
-
-    // Stop the server
-    void stop() {
-        // Stop accepting new connections
-        acceptor_.close();
-
-        // Close all connections
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto& [id, connection] : connections_) {
-                connection->close();
+    acceptor_.async_accept(newConnection->socket(),
+        [this, newConnection](const asio::error_code& ec) {
+            if (!ec) {
+                // Register and start the connection
+                registerConnection(newConnection);
+                newConnection->start(packetCallback_, closedCallback_);
+            } else {
+                std::cerr << "Error accepting connection: " << ec.message() << std::endl;
             }
-            connections_.clear();
-        }
 
-        // Stop the io_context
-        work_guard_.reset();
-
-        // Wait for all threads to complete
-        for (auto& thread : threads_) {
-            if (thread.joinable()) {
-                thread.join();
+            // Continue accepting connections if acceptor is still open
+            if (acceptor_.is_open()) {
+                startAccept();
             }
-        }
-        threads_.clear();
+        });
+}
 
-        std::cout << "Server stopped" << std::endl;
-    }
-
-    // Register a new connection (called internally)
-    void registerConnection(const std::shared_ptr<Connection>& connection) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        connections_[connection->getId()] = connection;
-    }
-
-    // Unregister a connection (called internally)
-    void unregisterConnection(int connectionId) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        connections_.erase(connectionId);
-
-        // Notify using the callback
-        if (closedCallback_) {
-            closedCallback_(connectionId);
-        }
-    }
-
-private:
-    // Start accepting new connections
-    void startAccept() {
-        int connectionId = nextConnectionId_++;
-        auto newConnection = Connection::create(io_context_, *this, connectionId);
-
-        acceptor_.async_accept(newConnection->socket(),
-            [this, newConnection](const asio::error_code& ec) {
-                if (!ec) {
-                    // Register and start the connection
-                    registerConnection(newConnection);
-                    newConnection->start(packetCallback_, closedCallback_);
-                } else {
-                    std::cerr << "Error accepting connection: " << ec.message() << std::endl;
-                }
-
-                // Continue accepting connections if acceptor is still open
-                if (acceptor_.is_open()) {
-                    startAccept();
-                }
-            });
-    }
-
-    asio::io_context io_context_;
-    asio::ip::tcp::acceptor acceptor_;
-    std::unique_ptr<asio::executor_work_guard<asio::io_context::executor_type>> work_guard_;
-    int port_;
-    std::atomic<int> nextConnectionId_;
-    std::atomic<uint32_t> nextSequence_;
-    int thread_pool_size_;
-    std::unordered_map<int, std::shared_ptr<Connection>> connections_;
-    mutable std::mutex mutex_;
-    std::vector<std::thread> threads_;
-
-    PacketReceivedCallback packetCallback_;
-    ConnectionClosedCallback closedCallback_;
-};
-
-// Implementation of Connection::start
+// Connection implementation
 void Connection::start(const PacketReceivedCallback& packetCallback,
                        const ConnectionClosedCallback& closedCallback) {
     packetCallback_ = packetCallback;
@@ -390,15 +401,42 @@ void Connection::start(const PacketReceivedCallback& packetCallback,
         std::cerr << "Error getting remote endpoint: " << e.what() << std::endl;
     }
 
-    // Send welcome message as a BIND_RESP packet
-    std::string welcomeMsg = "Welcome to the high performance Asio TCP server!";
-    sendData(PacketHeader::BIND_RESP, 0, server_.getNextSequence(), welcomeMsg);
-
-    // Start reading header
+    // Don't send welcome message immediately, wait for BIND packet
+    // Instead, just start reading
     readHeader();
 }
 
-// Implementation of Connection::readHeader
+void Connection::sendPacket(const Packet& packet) {
+    auto self = shared_from_this();
+    auto serialized = packet.serialize();
+
+    // Use strand to ensure thread safety for write operations
+    asio::post(strand_, [self, serialized]() {
+        bool write_in_progress = !self->write_queue_.empty();
+        self->write_queue_.push_back(serialized);
+
+        if (!write_in_progress) {
+            self->doWrite();
+        }
+    });
+}
+
+void Connection::sendData(uint8_t packetId, uint8_t status, uint32_t sequence, const std::string& data) {
+    auto packet = Packet::createPacket(packetId, status, sequence, data);
+    sendPacket(packet);
+}
+
+void Connection::close() {
+    // Use strand to ensure thread safety
+    asio::post(strand_, [self = shared_from_this()]() {
+        if (self->socket_.is_open()) {
+            asio::error_code ec;
+            self->socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+            self->socket_.close(ec);
+        }
+    });
+}
+
 void Connection::readHeader() {
     auto self = shared_from_this();
 
@@ -455,7 +493,6 @@ void Connection::readHeader() {
             }));
 }
 
-// Implementation of Connection::readPayload
 void Connection::readPayload() {
     auto self = shared_from_this();
 
@@ -487,7 +524,6 @@ void Connection::readPayload() {
             }));
 }
 
-// Implementation of Connection::processPacket
 void Connection::processPacket() {
     // Create complete packet
     Packet packet;
@@ -501,10 +537,17 @@ void Connection::processPacket() {
 
     // Handle specific packet types automatically
     switch (packet.header.packetId) {
-        case PacketHeader::BIND:
-            // Auto-respond to BIND with BIND_RESP
-            sendData(PacketHeader::BIND_RESP, 0, packet.header.sequence, "Bind successful");
+        case PacketHeader::BIND: {
+            // Extract client ID from payload
+            client_id_ = (packet.payload.empty()) ?
+                "unknown" : std::string(packet.payload.begin(), packet.payload.end());
+
+            std::cout << "Client " << id_ << " identified itself as: " << client_id_ << std::endl;
+
+            // Respond with BIND_RESP containing server ID
+            sendData(PacketHeader::BIND_RESP, 0, packet.header.sequence, server_.getServerId());
             break;
+        }
 
         case PacketHeader::REQUEST:
             // For demonstration, echo back the request with RESPONSE
@@ -515,7 +558,6 @@ void Connection::processPacket() {
     }
 }
 
-// Implementation of Connection::doWrite
 void Connection::doWrite() {
     auto self = shared_from_this();
 
@@ -549,8 +591,8 @@ std::string packetTypeToString(uint8_t packetId) {
 // Example usage
 int main() {
     try {
-        // Create and configure server
-        TcpServer server(8080);
+        // Create and configure server with custom ID
+        TcpServer server(8080, DEFAULT_THREAD_POOL_SIZE, "SERVER_MAIN_001");
 
         // Set callbacks
         server.setCallbacks(
@@ -602,12 +644,21 @@ int main() {
                 std::cout << "Active connections: " << server.connectionCount() << std::endl;
             } else if (cmd == "help") {
                 std::cout << "Available commands:" << std::endl
+                          << "  clients               - List all connected clients" << std::endl
                           << "  send <id> <type> <msg> - Send message to specific client" << std::endl
                           << "                           Type: bind, bind_resp, req, resp" << std::endl
                           << "  broadcast <type> <msg> - Send message to all clients" << std::endl
                           << "  close <id>            - Close a specific connection" << std::endl
                           << "  count                 - Show number of active connections" << std::endl
                           << "  quit                  - Stop server and exit" << std::endl;
+            } else if (cmd == "clients") {
+                std::cout << "Connected clients:" << std::endl;
+                for (int i = 1; i < server.connectionCount() + 100; i++) {  // Use a large enough range
+                    std::string clientId = server.getClientInfo(i);
+                    if (clientId != "Not found") {
+                        std::cout << "  Connection " << i << ": Client ID = " << clientId << std::endl;
+                    }
+                }
             } else if (cmd.substr(0, 4) == "send" && cmd.length() > 4) {
                 // Parse command: send <id> <type> <message>
                 std::istringstream iss(cmd.substr(5));
