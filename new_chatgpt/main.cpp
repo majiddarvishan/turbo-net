@@ -11,8 +11,13 @@
 #include <thread>
 #include <functional>
 
+
 using boost::asio::ip::tcp;
 using asio_timer = boost::asio::steady_timer;
+
+// Pre-allocate common buffer sizes
+static constexpr size_t MAX_HEADER = 16;
+static constexpr size_t MAX_PDU_SIZE = 1024 * 8; // adjust as needed
 
 // SMPP PDU base
 class SmppPdu {
@@ -23,24 +28,29 @@ public:
     uint32_t sequence_number;
     std::vector<uint8_t> body;
 
-    virtual ~SmppPdu() = default;
+    // Reserve capacity once
+    SmppPdu() { body.reserve(256); }
 
     std::vector<uint8_t> serialize() const {
-        uint32_t len = 16 + body.size();
-        std::vector<uint8_t> buf(len);
-        uint32_t *hdr = reinterpret_cast<uint32_t*>(buf.data());
-        hdr[0] = boost::endian::native_to_big(len);
-        hdr[1] = boost::endian::native_to_big(command_id);
-        hdr[2] = boost::endian::native_to_big(command_status);
-        hdr[3] = boost::endian::native_to_big(sequence_number);
-        if (!body.empty()) std::copy(body.begin(), body.end(), buf.begin() + 16);
+        std::vector<uint8_t> buf;
+        buf.reserve(16 + body.size());
+        // header
+        uint32_t hdrs[4] = {
+            boost::endian::native_to_big(static_cast<uint32_t>(16 + body.size())),
+            boost::endian::native_to_big(command_id),
+            boost::endian::native_to_big(command_status),
+            boost::endian::native_to_big(sequence_number)
+        };
+        buf.insert(buf.end(), reinterpret_cast<uint8_t*>(hdrs), reinterpret_cast<uint8_t*>(hdrs+4));
+        // body
+        if (!body.empty()) buf.insert(buf.end(), body.begin(), body.end());
         return buf;
     }
 
     static std::shared_ptr<SmppPdu> deserialize(const uint8_t* data, size_t size) {
-        if (size < 16) return nullptr;
+        if (size < MAX_HEADER) return nullptr;
         uint32_t cmd_len = boost::endian::big_to_native(*reinterpret_cast<const uint32_t*>(data));
-        if (size < cmd_len) return nullptr;
+        if (size < cmd_len || cmd_len > MAX_PDU_SIZE) return nullptr;
         auto pdu = std::make_shared<SmppPdu>();
         pdu->command_length = cmd_len;
         pdu->command_id = boost::endian::big_to_native(*reinterpret_cast<const uint32_t*>(data+4));
@@ -89,10 +99,10 @@ public:
 // Shared Session: handles client or server connection
 class SmppSession : public std::enable_shared_from_this<SmppSession> {
     tcp::socket socket_;
-    std::vector<uint8_t> recv_buffer_;
+    boost::asio::io_context::strand strand_;
+    boost::asio::streambuf streambuf_;
     asio_timer inactivity_timer_;
-    std::unordered_map<uint32_t, asio_timer> pending_timers_;
-    boost::asio::io_context& io_context_;
+    boost::container::flat_map<uint32_t, std::unique_ptr<asio_timer>> pending_timers_;
     std::atomic<uint32_t> seq_{1};
 
 public:
@@ -102,53 +112,93 @@ public:
     std::function<void(uint32_t)> on_timeout;
     std::function<void()> on_close;
 
-    explicit SmppSession(boost::asio::io_context& ctx)
-      : socket_(ctx), inactivity_timer_(ctx), io_context_(ctx) {}
+    SmppSession(boost::asio::io_context& ctx)
+      : socket_(ctx)
+      , strand_(ctx)
+      , inactivity_timer_(ctx) {
+        pending_timers_.reserve(128);
+    }
 
     tcp::socket& socket() { return socket_; }
 
-    void start() { reset_inactivity_timer(); do_read(); schedule_enquire_link(); }
-    void close() { boost::system::error_code ec; socket_.close(ec); if (on_close) on_close(); }
-
-    void send_pdu(std::shared_ptr<SmppPdu> pdu, std::chrono::seconds timeout = std::chrono::seconds(30)) {
-        uint32_t seq = pdu->sequence_number = seq_++;
-        auto buf = pdu->serialize();
-        auto self = shared_from_this();
-        asio_timer timer(io_context_, timeout);
-        pending_timers_.emplace(seq, std::move(timer));
-        auto &t = pending_timers_[seq];
-        t.async_wait([this, self, seq](auto ec) { if (!ec) { pending_timers_.erase(seq); if (on_timeout) on_timeout(seq); }});
-        boost::asio::async_write(socket_, boost::asio::buffer(buf), [this, self](auto ec, auto){ if (ec) close(); });
+    void start() {
+        reset_inactivity_timer();
+        read_header();
     }
 
-    // For client: connect then start
-    void connect(const std::string& host, unsigned short port) {
-        socket_.connect({boost::asio::ip::address::from_string(host), port});
-        start();
+    void close() {
+        boost::system::error_code ec;
+        socket_.close(ec);
+        if (on_close) on_close();
+    }
+
+    void send_pdu(const std::shared_ptr<SmppPdu>& pdu, std::chrono::seconds timeout = std::chrono::seconds(30)) {
+        auto buf = pdu->serialize();
+        auto self = shared_from_this();
+        auto seq = pdu->sequence_number;
+
+        // track timeout
+        auto timer = std::make_unique<asio_timer>(socket_.get_executor().context(), timeout);
+        timer->async_wait(boost::asio::bind_executor(strand_, [this, self, seq](auto ec){
+            if (!ec) {
+                pending_timers_.erase(seq);
+                if (on_timeout) on_timeout(seq);
+            }
+        }));
+        pending_timers_.emplace(seq, std::move(timer));
+
+        // async write
+        boost::asio::async_write(socket_, boost::asio::buffer(buf),
+            boost::asio::bind_executor(strand_, [this, self](auto ec, auto){ if (ec) close(); }));
     }
 
 private:
-    void do_read() {
+    void read_header() {
         auto self = shared_from_this();
-        socket_.async_read_some(boost::asio::buffer(std::back_inserter(recv_buffer_), 4096),
-            [this, self](auto ec, auto){ if (ec) { close(); return; } reset_inactivity_timer(); parse_buffer(); do_read(); });
+        boost::asio::async_read(socket_, streambuf_, boost::asio::transfer_exactly(MAX_HEADER),
+            boost::asio::bind_executor(strand_, [this, self](auto ec, auto){
+                if (ec) { close(); return; }
+                handle_header();
+            }));
     }
 
-    void parse_buffer() {
-        while (recv_buffer_.size() >= 16) {
-            uint32_t cmd_len = boost::endian::big_to_native(*reinterpret_cast<const uint32_t*>(recv_buffer_.data()));
-            if (recv_buffer_.size() < cmd_len) break;
-            auto pdu = SmppPdu::deserialize(recv_buffer_.data(), cmd_len);
-            recv_buffer_.erase(recv_buffer_.begin(), recv_buffer_.begin() + cmd_len);
-            if (!pdu) continue;
-            auto it = pending_timers_.find(pdu->sequence_number);
-            if (it != pending_timers_.end()) { it->second.cancel(); pending_timers_.erase(it); if (on_response) on_response(pdu); }
-            else if (on_request) on_request(pdu);
+    void handle_header() {
+        auto data = boost::asio::buffer_cast<const uint8_t*>(streambuf_.data());
+        uint32_t cmd_len = boost::endian::big_to_native(*reinterpret_cast<const uint32_t*>(data));
+        if (cmd_len < MAX_HEADER || cmd_len > MAX_PDU_SIZE) { close(); return; }
+        read_body(cmd_len - MAX_HEADER);
+    }
+
+    void read_body(size_t size) {
+        auto self = shared_from_this();
+        boost::asio::async_read(socket_, streambuf_, boost::asio::transfer_exactly(size),
+            boost::asio::bind_executor(strand_, [this, self, size](auto ec, auto){
+                if (ec) { close(); return; }
+                parse_pdu(size + MAX_HEADER);
+                reset_inactivity_timer();
+                read_header();
+            }));
+    }
+
+    void parse_pdu(size_t total) {
+        auto data = boost::asio::buffer_cast<const uint8_t*>(streambuf_.data());
+        auto pdu = SmppPdu::deserialize(data, total);
+        streambuf_.consume(total);
+        if (!pdu) return;
+        auto it = pending_timers_.find(pdu->sequence_number);
+        if (it != pending_timers_.end()) {
+            it->second->cancel();
+            pending_timers_.erase(it);
+            if (on_response) on_response(pdu);
+        } else if (on_request) {
+            on_request(pdu);
         }
     }
 
-    void reset_inactivity_timer() { inactivity_timer_.expires_after(std::chrono::seconds(60)); inactivity_timer_.async_wait([this](auto ec){ if (!ec) close(); }); }
-    void schedule_enquire_link() { auto self=shared_from_this(); auto timer = std::make_shared<asio_timer>(io_context_, std::chrono::seconds(30));; timer->async_wait([this,self,timer](auto ec){ if (!ec) { send_pdu(std::make_shared<EnquireLink>(seq_++)); schedule_enquire_link(); }}); }
+    void reset_inactivity_timer() {
+        inactivity_timer_.expires_after(std::chrono::seconds(60));
+        inactivity_timer_.async_wait(boost::asio::bind_executor(strand_, [this](auto ec){ if (!ec) close(); }));
+    }
 };
 
 // Dedicated Client class wrapping SmppSession
