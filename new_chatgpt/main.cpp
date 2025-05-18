@@ -51,6 +51,35 @@ public:
     }
 };
 
+class BindTransceiver : public SmppPdu {
+public:
+    BindTransceiver(uint32_t seq, const std::string& system_id, const std::string& password) {
+        command_id = 0x00000009; // bind_transceiver
+        command_status = 0;
+        sequence_number = seq;
+        // body: system_id\0 password\0 system_type\0 interface_version addr_ton addr_npi address_range\0
+        body.insert(body.end(), system_id.begin(), system_id.end()); body.push_back(0);
+        body.insert(body.end(), password.begin(), password.end()); body.push_back(0);
+        body.push_back(0); // empty system_type
+        body.push_back(0x34); // version 0x34
+        body.push_back(0); // TON
+        body.push_back(0); // NPI
+        body.push_back(0); // address_range
+    }
+};
+
+class BindTransceiverResp : public SmppPdu {
+public:
+    BindTransceiverResp(uint32_t seq, uint32_t status=0) {
+        command_id = 0x80000009; // bind_transceiver_resp
+        command_status = status;
+        sequence_number = seq;
+        std::string system_id = "SMPP-SERVER";
+        body.insert(body.end(), system_id.begin(), system_id.end());
+        body.push_back(0);
+    }
+};
+
 // Enquire Link PDU
 class EnquireLink : public SmppPdu {
 public:
@@ -155,7 +184,9 @@ public:
         if(thread_.joinable()) thread_.join();
     }
 
+    void bind_transceiver(const std::string& sys_id,const std::string& pwd){ auto p=std::make_shared<BindTransceiver>(1,sys_id,pwd); send_pdu(p); }
     // Send arbitrary PDU
+
     void send_pdu(std::shared_ptr<SmppPdu> pdu, std::chrono::seconds timeout = std::chrono::seconds(30)) {
         session_->send_pdu(pdu, timeout);
     }
@@ -174,9 +205,17 @@ public:
     }
     ~SmppServer(){ io_context_.stop(); for(auto& t:thread_pool_) t.join(); }
 private:
-    void start_accept() {
-        auto session = std::make_shared<SmppSession>(io_context_);
-        acceptor_.async_accept(session->socket(), [this, session](auto ec){ if(!ec) session->start(); start_accept(); });
+     void start_accept()
+     {
+        auto sess=std::make_shared<SmppSession>(io_context_);
+        sess->on_request=[sess](auto p){ if(p->command_id==0x00000009){ // bind_transceiver
+                auto resp=std::make_shared<BindTransceiverResp>(p->sequence_number);
+                sess->send_pdu(resp);
+            } else {
+                // other requests
+            }
+        };
+        acceptor_.async_accept(sess->socket(),[this,sess](auto ec){ if(!ec) sess->start(); start_accept(); });
     }
 };
 
@@ -192,6 +231,8 @@ int main() {
     client.on_timeout = [](auto seq){ std::cerr<<"Timeout "<<seq<<"\n"; };
     client.on_close = []{ std::cerr<<"Disconnected\n"; };
     client.connect("127.0.0.1", 2775);
+    client.bind_transceiver("sys","pwd");
+
 
     // ... build and send a bind_transceiver PDU ...
     auto bind = std::make_shared<SmppPdu>(); // fill fields
