@@ -3,14 +3,14 @@
 
 #include <boost/asio.hpp>
 #include <boost/endian/conversion.hpp>
+#include <boost/container/flat_map.hpp>
+#include <boost/pool/object_pool.hpp>
 #include <iostream>
-#include <unordered_map>
 #include <vector>
 #include <memory>
 #include <atomic>
 #include <thread>
 #include <functional>
-
 
 using boost::asio::ip::tcp;
 using asio_timer = boost::asio::steady_timer;
@@ -19,6 +19,9 @@ using asio_timer = boost::asio::steady_timer;
 static constexpr size_t MAX_HEADER = 16;
 static constexpr size_t MAX_PDU_SIZE = 1024 * 8; // adjust as needed
 
+// Custom allocator for PDU bodies via object pool
+static boost::object_pool<std::vector<uint8_t>> body_pool;
+
 // SMPP PDU base
 class SmppPdu {
 public:
@@ -26,25 +29,26 @@ public:
     uint32_t command_id;
     uint32_t command_status;
     uint32_t sequence_number;
-    std::vector<uint8_t> body;
+    std::vector<uint8_t>* body;
 
-    // Reserve capacity once
-    SmppPdu() { body.reserve(256); }
+    SmppPdu() {
+        body = body_pool.construct();
+        body->reserve(256);
+    }
+    ~SmppPdu() {
+        body->clear();
+        // pool will reclaim
+    }
 
-    std::vector<uint8_t> serialize() const {
-        std::vector<uint8_t> buf;
-        buf.reserve(16 + body.size());
-        // header
+    // Zero-copy header buffers
+    std::array<boost::asio::const_buffer, 2> to_buffers() const {
         uint32_t hdrs[4] = {
-            boost::endian::native_to_big(static_cast<uint32_t>(16 + body.size())),
+            boost::endian::native_to_big(command_length),
             boost::endian::native_to_big(command_id),
             boost::endian::native_to_big(command_status),
             boost::endian::native_to_big(sequence_number)
         };
-        buf.insert(buf.end(), reinterpret_cast<uint8_t*>(hdrs), reinterpret_cast<uint8_t*>(hdrs+4));
-        // body
-        if (!body.empty()) buf.insert(buf.end(), body.begin(), body.end());
-        return buf;
+        return { boost::asio::buffer(hdrs, MAX_HEADER), boost::asio::buffer(*body) };
     }
 
     static std::shared_ptr<SmppPdu> deserialize(const uint8_t* data, size_t size) {
@@ -56,7 +60,7 @@ public:
         pdu->command_id = boost::endian::big_to_native(*reinterpret_cast<const uint32_t*>(data+4));
         pdu->command_status = boost::endian::big_to_native(*reinterpret_cast<const uint32_t*>(data+8));
         pdu->sequence_number = boost::endian::big_to_native(*reinterpret_cast<const uint32_t*>(data+12));
-        pdu->body.assign(data+16, data+cmd_len);
+        pdu->body->assign(data+16, data+cmd_len);
         return pdu;
     }
 };
@@ -116,7 +120,7 @@ public:
       : socket_(ctx)
       , strand_(ctx)
       , inactivity_timer_(ctx) {
-        pending_timers_.reserve(128);
+        pending_timers_.reserve(256);
     }
 
     tcp::socket& socket() { return socket_; }
@@ -132,24 +136,33 @@ public:
         if (on_close) on_close();
     }
 
-    void send_pdu(const std::shared_ptr<SmppPdu>& pdu, std::chrono::seconds timeout = std::chrono::seconds(30)) {
-        auto buf = pdu->serialize();
+     // Batch PDUs: queue buffers for multi-write
+    template<class Iter>
+    void send_batch(Iter begin, Iter end, std::chrono::seconds timeout = std::chrono::seconds(30)) {
+        std::vector<boost::asio::const_buffer> bufs;
+        bufs.reserve(std::distance(begin,end)*2);
+        for(auto it=begin; it!=end; ++it) {
+            auto& pdu = *it;
+            pdu->sequence_number = seq_++;
+            bufs.emplace_back(boost::asio::buffer(&pdu->command_length, 16));
+            bufs.emplace_back(boost::asio::buffer(*pdu->body));
+            // setup timeout per PDU as needed
+        }
         auto self = shared_from_this();
-        auto seq = pdu->sequence_number;
+        boost::asio::async_write(socket_, bufs,
+            boost::asio::bind_executor(strand_, [this,self](auto ec, auto){ if(ec) close(); }));
+    }
 
-        // track timeout
+        void send_pdu(const std::shared_ptr<SmppPdu>& pdu, std::chrono::seconds timeout = std::chrono::seconds(30)) {
+        pdu->sequence_number = seq_++;
+        auto bufs = pdu->to_buffers();
+        auto self = shared_from_this();
         auto timer = std::make_unique<asio_timer>(socket_.get_executor().context(), timeout);
-        timer->async_wait(boost::asio::bind_executor(strand_, [this, self, seq](auto ec){
-            if (!ec) {
-                pending_timers_.erase(seq);
-                if (on_timeout) on_timeout(seq);
-            }
-        }));
+        auto seq = pdu->sequence_number;
+        timer->async_wait(boost::asio::bind_executor(strand_, [this,self,seq](auto ec){ if(!ec){ pending_timers_.erase(seq); if(on_timeout) on_timeout(seq);} }));
         pending_timers_.emplace(seq, std::move(timer));
-
-        // async write
-        boost::asio::async_write(socket_, boost::asio::buffer(buf),
-            boost::asio::bind_executor(strand_, [this, self](auto ec, auto){ if (ec) close(); }));
+        boost::asio::async_write(socket_, bufs,
+            boost::asio::bind_executor(strand_, [this,self](auto ec, auto){ if(ec) close(); }));
     }
 
 private:
