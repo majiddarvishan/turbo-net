@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <functional>
 #include <atomic>
-#include <asio.hpp>
+#include <boost/asio.hpp>
 #include <cstring>
 #include <deque>
 #include <chrono>
@@ -146,9 +146,9 @@ public:
 private:
     void startAccept();
 
-    asio::io_context io_context_;
-    asio::ip::tcp::acceptor acceptor_;
-    std::unique_ptr<asio::executor_work_guard<asio::io_context::executor_type>> work_guard_;
+    boost::asio::io_context io_context_;
+    boost::asio::ip::tcp::acceptor acceptor_;
+    std::unique_ptr<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> work_guard_;
     int port_;
     std::atomic<int> nextConnectionId_;
     std::atomic<uint32_t> nextSequence_;
@@ -164,7 +164,7 @@ private:
     // Request tracking
     std::map<uint32_t, PendingRequest> pendingRequests_;
     std::mutex requestsMutex_;
-    asio::steady_timer timeoutTimer_;
+    boost::asio::steady_timer timeoutTimer_;
     bool timeoutTimerRunning_ = false;
     ResponseTimeoutCallback timeoutCallback_;
 };
@@ -176,12 +176,12 @@ public:
     using Pointer = std::shared_ptr<Connection>;
 
     // Factory method to create a new connection
-    static Pointer create(asio::io_context& io_context, TcpServer& server, int id) {
+    static Pointer create(boost::asio::io_context& io_context, TcpServer& server, int id) {
         return Pointer(new Connection(io_context, server, id));
     }
 
     // Get the socket associated with this connection
-    asio::ip::tcp::socket& socket() {
+    boost::asio::ip::tcp::socket& socket() {
         return socket_;
     }
 
@@ -210,9 +210,9 @@ public:
 
 private:
     // Private constructor - use factory method instead
-    Connection(asio::io_context& io_context, TcpServer& server, int id)
+    Connection(boost::asio::io_context& io_context, TcpServer& server, int id)
         : socket_(io_context),
-          strand_(asio::make_strand(io_context)),
+          strand_(boost::asio::make_strand(io_context)),
           server_(server),
           id_(id),
           client_id_("unknown"), // Initialize client ID
@@ -239,8 +239,8 @@ private:
         PAYLOAD
     };
 
-    asio::ip::tcp::socket socket_;
-    asio::strand<asio::io_context::executor_type> strand_;
+    boost::asio::ip::tcp::socket socket_;
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     TcpServer& server_;
     int id_;
     std::string client_id_;  // Store client ID from BIND packet
@@ -261,7 +261,7 @@ private:
 // TcpServer implementation
 TcpServer::TcpServer(int port, int numThreads, const std::string& serverId)
     : io_context_(),
-      acceptor_(io_context_, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)),
+      acceptor_(io_context_, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), port)),
       port_(port),
       nextConnectionId_(1),
       nextSequence_(1),
@@ -313,7 +313,7 @@ uint32_t TcpServer::sendRequest(int connectionId, const std::string& data,
         if (!timeoutTimerRunning_) {
             timeoutTimerRunning_ = true;
             timeoutTimer_.expires_after(std::chrono::milliseconds(100));  // Check every 100ms
-            timeoutTimer_.async_wait([this](const asio::error_code& error) {
+            timeoutTimer_.async_wait([this](const boost::system::error_code& error) {
                 checkTimeouts(error);
             });
         }
@@ -323,7 +323,7 @@ uint32_t TcpServer::sendRequest(int connectionId, const std::string& data,
 }
 
 // Add method to check for timeouts
-void TcpServer::checkTimeouts(const asio::error_code& error) {
+void TcpServer::checkTimeouts(const boost::system::error_code& error) {
     if (error) {
         // Timer was cancelled or errored
         std::lock_guard<std::mutex> lock(requestsMutex_);
@@ -365,7 +365,7 @@ void TcpServer::checkTimeouts(const asio::error_code& error) {
     // Reschedule the timer if we still have pending requests
     if (hasPending) {
         timeoutTimer_.expires_after(std::chrono::milliseconds(100));
-        timeoutTimer_.async_wait([this](const asio::error_code& error) {
+        timeoutTimer_.async_wait([this](const boost::system::error_code& error) {
             checkTimeouts(error);
         });
     } else {
@@ -418,8 +418,8 @@ void TcpServer::start() {
     std::cout << "Server ID: " << server_id_ << std::endl;
 
     // Create work guard to keep io_context running
-    work_guard_ = std::make_unique<asio::executor_work_guard<asio::io_context::executor_type>>(
-        asio::make_work_guard(io_context_));
+    work_guard_ = std::make_unique<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>(
+        boost::asio::make_work_guard(io_context_));
 
     // Create a shared_ptr to 'this' for use in the connection callbacks
     auto self = shared_from_this();
@@ -556,7 +556,7 @@ void TcpServer::startAccept() {
     auto newConnection = Connection::create(io_context_, *this, connectionId);
 
     acceptor_.async_accept(newConnection->socket(),
-        [this, newConnection](const asio::error_code& ec) {
+        [this, newConnection](const boost::system::error_code& ec) {
             if (!ec) {
                 // Register and start the connection
                 registerConnection(newConnection);
@@ -598,7 +598,7 @@ void Connection::sendPacket(const Packet& packet) {
     auto serialized = packet.serialize();
 
     // Use strand to ensure thread safety for write operations
-    asio::post(strand_, [self, serialized]() {
+    boost::asio::post(strand_, [self, serialized]() {
         bool write_in_progress = !self->write_queue_.empty();
         self->write_queue_.push_back(serialized);
 
@@ -615,10 +615,10 @@ void Connection::sendData(uint8_t packetId, uint8_t status, uint32_t sequence, c
 
 void Connection::close() {
     // Use strand to ensure thread safety
-    asio::post(strand_, [self = shared_from_this()]() {
+    boost::asio::post(strand_, [self = shared_from_this()]() {
         if (self->socket_.is_open()) {
-            asio::error_code ec;
-            self->socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+            boost::system::error_code ec;
+            self->socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
             self->socket_.close(ec);
         }
     });
@@ -627,11 +627,11 @@ void Connection::close() {
 void Connection::readHeader() {
     auto self = shared_from_this();
 
-    asio::async_read(socket_,
-        asio::buffer(header_buffer_.data() + header_bytes_read_,
+    boost::asio::async_read(socket_,
+        boost::asio::buffer(header_buffer_.data() + header_bytes_read_,
                     sizeof(PacketHeader) - header_bytes_read_),
-        asio::bind_executor(strand_,
-            [this, self](const asio::error_code& ec, std::size_t bytes_transferred) {
+        boost::asio::bind_executor(strand_,
+            [this, self](const boost::system::error_code& ec, std::size_t bytes_transferred) {
                 if (!ec) {
                     header_bytes_read_ += bytes_transferred;
 
@@ -672,7 +672,7 @@ void Connection::readHeader() {
                         // Continue reading header
                         readHeader();
                     }
-                } else if (ec != asio::error::operation_aborted) {
+                } else if (ec != boost::asio::error::operation_aborted) {
                     // Handle read error
                     std::cerr << "Header read error: " << ec.message() << std::endl;
                     server_.unregisterConnection(id_);
@@ -683,11 +683,11 @@ void Connection::readHeader() {
 void Connection::readPayload() {
     auto self = shared_from_this();
 
-    asio::async_read(socket_,
-        asio::buffer(current_payload_.data() + payload_bytes_read_,
+    boost::asio::async_read(socket_,
+        boost::asio::buffer(current_payload_.data() + payload_bytes_read_,
                     current_payload_size_ - payload_bytes_read_),
-        asio::bind_executor(strand_,
-            [this, self](const asio::error_code& ec, std::size_t bytes_transferred) {
+        boost::asio::bind_executor(strand_,
+            [this, self](const boost::system::error_code& ec, std::size_t bytes_transferred) {
                 if (!ec) {
                     payload_bytes_read_ += bytes_transferred;
 
@@ -703,7 +703,7 @@ void Connection::readPayload() {
                         // Continue reading payload
                         readPayload();
                     }
-                } else if (ec != asio::error::operation_aborted) {
+                } else if (ec != boost::asio::error::operation_aborted) {
                     // Handle read error
                     std::cerr << "Payload read error: " << ec.message() << std::endl;
                     server_.unregisterConnection(id_);
@@ -748,16 +748,16 @@ void Connection::processPacket() {
 void Connection::doWrite() {
     auto self = shared_from_this();
 
-    asio::async_write(socket_,
-        asio::buffer(write_queue_.front()),
-        asio::bind_executor(strand_,
-            [this, self](const asio::error_code& ec, std::size_t /*length*/) {
+    boost::asio::async_write(socket_,
+        boost::asio::buffer(write_queue_.front()),
+        boost::asio::bind_executor(strand_,
+            [this, self](const boost::system::error_code& ec, std::size_t /*length*/) {
                 if (!ec) {
                     write_queue_.pop_front();
                     if (!write_queue_.empty()) {
                         doWrite();
                     }
-                } else if (ec != asio::error::operation_aborted) {
+                } else if (ec != boost::asio::error::operation_aborted) {
                     std::cerr << "Write error: " << ec.message() << std::endl;
                     server_.unregisterConnection(id_);
                 }

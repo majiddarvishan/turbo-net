@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <functional>
 #include <atomic>
-#include <asio.hpp>
+#include <boost/asio.hpp>
 #include <cstring>
 #include <deque>
 #include <chrono>
@@ -104,8 +104,8 @@ public:
     TcpClient(const std::string& host, int port, const std::string& clientId)
         : io_context_(),
           socket_(io_context_),
-          work_guard_(asio::make_work_guard(io_context_)),
-          strand_(asio::make_strand(io_context_)),
+          work_guard_(boost::asio::make_work_guard(io_context_)),
+          strand_(boost::asio::make_strand(io_context_)),
           timer_(io_context_),
           reconnect_timer_(io_context_),
           host_(host),
@@ -139,7 +139,7 @@ public:
         reconnect_enabled_ = false;
 
         // Cancel any pending timers
-        asio::error_code ec;
+        boost::system::error_code ec;
         timer_.cancel(ec);
         reconnect_timer_.cancel(ec);
 
@@ -181,7 +181,7 @@ public:
         auto self = shared_from_this();
         auto serialized = packet.serialize();
 
-        asio::post(strand_, [this, self, serialized]() {
+        boost::asio::post(strand_, [this, self, serialized]() {
             bool write_in_progress = !write_queue_.empty();
             write_queue_.push_back(serialized);
 
@@ -291,7 +291,7 @@ private:
     void connect() {
         auto self = shared_from_this();
 
-        asio::post(strand_, [this, self]() {
+        boost::asio::post(strand_, [this, self]() {
             // Close the socket if it's open
             close();
 
@@ -304,17 +304,17 @@ private:
             std::cout << "Connecting to " << host_ << ":" << port_ << "..." << std::endl;
 
             // Resolve the host name and service
-            asio::ip::tcp::resolver resolver(io_context_);
-            asio::ip::tcp::resolver::query query(host_, std::to_string(port_));
+            boost::asio::ip::tcp::resolver resolver(io_context_);
+            boost::asio::ip::tcp::resolver::query query(host_, std::to_string(port_));
 
             resolver.async_resolve(query,
-                asio::bind_executor(strand_, [this, self](const asio::error_code& ec,
-                                               asio::ip::tcp::resolver::iterator iterator) {
+                boost::asio::bind_executor(strand_, [this, self](const boost::system::error_code& ec,
+                                               boost::asio::ip::tcp::resolver::iterator iterator) {
                     if (!ec) {
                         // Connect to the server
-                        asio::async_connect(socket_, iterator,
-                            asio::bind_executor(strand_, [this, self](const asio::error_code& ec,
-                                                         asio::ip::tcp::resolver::iterator) {
+                        boost::asio::async_connect(socket_, iterator,
+                            boost::asio::bind_executor(strand_, [this, self](const boost::system::error_code& ec,
+                                                         boost::asio::ip::tcp::resolver::iterator) {
                                 if (!ec) {
                                     std::cout << "Connected to server" << std::endl;
                                     connected_ = true;
@@ -349,11 +349,11 @@ private:
     void readHeader() {
         auto self = shared_from_this();
 
-        asio::async_read(socket_,
-            asio::buffer(header_buffer_.data() + header_bytes_read_,
+        boost::asio::async_read(socket_,
+            boost::asio::buffer(header_buffer_.data() + header_bytes_read_,
                         sizeof(PacketHeader) - header_bytes_read_),
-            asio::bind_executor(strand_,
-                [this, self](const asio::error_code& ec, std::size_t bytes_transferred) {
+            boost::asio::bind_executor(strand_,
+                [this, self](const boost::system::error_code& ec, std::size_t bytes_transferred) {
                     if (!ec) {
                         header_bytes_read_ += bytes_transferred;
 
@@ -394,7 +394,7 @@ private:
                             // Continue reading header
                             readHeader();
                         }
-                    } else if (ec != asio::error::operation_aborted) {
+                    } else if (ec != boost::asio::error::operation_aborted) {
                         // Handle read error
                         std::cerr << "Header read error: " << ec.message() << std::endl;
                         handleDisconnect();
@@ -406,11 +406,11 @@ private:
     void readPayload() {
         auto self = shared_from_this();
 
-        asio::async_read(socket_,
-            asio::buffer(current_payload_.data() + payload_bytes_read_,
+        boost::asio::async_read(socket_,
+            boost::asio::buffer(current_payload_.data() + payload_bytes_read_,
                         current_payload_size_ - payload_bytes_read_),
-            asio::bind_executor(strand_,
-                [this, self](const asio::error_code& ec, std::size_t bytes_transferred) {
+            boost::asio::bind_executor(strand_,
+                [this, self](const boost::system::error_code& ec, std::size_t bytes_transferred) {
                     if (!ec) {
                         payload_bytes_read_ += bytes_transferred;
 
@@ -426,7 +426,7 @@ private:
                             // Continue reading payload
                             readPayload();
                         }
-                    } else if (ec != asio::error::operation_aborted) {
+                    } else if (ec != boost::asio::error::operation_aborted) {
                         // Handle read error
                         std::cerr << "Payload read error: " << ec.message() << std::endl;
                         handleDisconnect();
@@ -488,7 +488,7 @@ private:
     void startTimeoutTimer() {
         auto self = shared_from_this();
 
-        asio::post(strand_, [this, self]() {
+        boost::asio::post(strand_, [this, self]() {
             bool hasPendingRequests = false;
 
             {
@@ -499,8 +499,8 @@ private:
             if (hasPendingRequests) {
                 timer_.cancel();
                 timer_.expires_after(std::chrono::milliseconds(100));  // Check every 100ms
-                timer_.async_wait(asio::bind_executor(strand_,
-                    [this, self](const asio::error_code& ec) {
+                timer_.async_wait(boost::asio::bind_executor(strand_,
+                    [this, self](const boost::system::error_code& ec) {
                         if (!ec) {
                             checkTimeouts();
                         }
@@ -544,8 +544,8 @@ private:
         if (hasPending) {
             timer_.expires_after(std::chrono::milliseconds(100));
             auto self = shared_from_this();
-            timer_.async_wait(asio::bind_executor(strand_,
-                [this, self](const asio::error_code& ec) {
+            timer_.async_wait(boost::asio::bind_executor(strand_,
+                [this, self](const boost::system::error_code& ec) {
                     if (!ec) {
                         checkTimeouts();
                     }
@@ -564,16 +564,16 @@ private:
     void doWrite() {
         auto self = shared_from_this();
 
-        asio::async_write(socket_,
-            asio::buffer(write_queue_.front()),
-            asio::bind_executor(strand_,
-                [this, self](const asio::error_code& ec, std::size_t /*length*/) {
+        boost::asio::async_write(socket_,
+            boost::asio::buffer(write_queue_.front()),
+            boost::asio::bind_executor(strand_,
+                [this, self](const boost::system::error_code& ec, std::size_t /*length*/) {
                     if (!ec) {
                         write_queue_.pop_front();
                         if (!write_queue_.empty()) {
                             doWrite();
                         }
-                    } else if (ec != asio::error::operation_aborted) {
+                    } else if (ec != boost::asio::error::operation_aborted) {
                         std::cerr << "Write error: " << ec.message() << std::endl;
                         handleDisconnect();
                     }
@@ -582,9 +582,9 @@ private:
 
     // Close the socket
     void close() {
-        asio::error_code ec;
+        boost::system::error_code ec;
         if (socket_.is_open()) {
-            socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+            socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
             socket_.close(ec);
         }
     }
@@ -614,8 +614,8 @@ private:
 
         auto self = shared_from_this();
         reconnect_timer_.expires_after(std::chrono::milliseconds(DEFAULT_RECONNECT_DELAY_MS));
-        reconnect_timer_.async_wait(asio::bind_executor(strand_,
-            [this, self](const asio::error_code& ec) {
+        reconnect_timer_.async_wait(boost::asio::bind_executor(strand_,
+            [this, self](const boost::system::error_code& ec) {
                 if (!ec && reconnect_enabled_) {
                     connect();
                 }
@@ -635,12 +635,12 @@ private:
     }
 
 private:
-    asio::io_context io_context_;
-    asio::ip::tcp::socket socket_;
-    asio::executor_work_guard<asio::io_context::executor_type> work_guard_;
-    asio::strand<asio::io_context::executor_type> strand_;
-    asio::steady_timer timer_;
-    asio::steady_timer reconnect_timer_;
+    boost::asio::io_context io_context_;
+    boost::asio::ip::tcp::socket socket_;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work_guard_;
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
+    boost::asio::steady_timer timer_;
+    boost::asio::steady_timer reconnect_timer_;
     std::thread io_thread_;
 
     std::string host_;

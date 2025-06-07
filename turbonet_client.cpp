@@ -1,8 +1,10 @@
 #include "turbonet_client.h"
+
+#include <boost/asio/write.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/connect.hpp>
+
 #include <cstring>
-#include <asio/connect.hpp>
-#include <asio/write.hpp>
-#include <asio/ip/tcp.hpp>
 
 namespace turbonet {
 
@@ -22,13 +24,13 @@ TurboNetClient::TurboNetClient(int readTimeoutMs,
                                int responseTimeoutMs,
                                std::size_t ioThreads)
     : ioCtx_(),
-      workGuard_(asio::make_work_guard(ioCtx_)),
+      workGuard_(boost::asio::make_work_guard(ioCtx_)),
       socket_(ioCtx_),
       connectTimer_(ioCtx_),
       readTimer_(ioCtx_),
       writeTimer_(ioCtx_),
       responseSweepTimer_(ioCtx_),
-      strand_(asio::make_strand(ioCtx_)),
+      strand_(boost::asio::make_strand(ioCtx_)),
       readTimeoutMs_(readTimeoutMs),
       writeTimeoutMs_(writeTimeoutMs),
       responseTimeoutMs_(responseTimeoutMs) {
@@ -66,14 +68,14 @@ void TurboNetClient::setCloseHandler(CloseHandler handler) {
 void TurboNetClient::connect(const std::string& host,
                              uint16_t port,
                              int timeoutMs,
-                             std::function<void(const asio::error_code&)> onConnect) {
+                             std::function<void(const boost::system::error_code&)> onConnect) {
     connectHandler_ = std::move(onConnect);
-    asio::ip::tcp::resolver resolver(ioCtx_);
+    boost::asio::ip::tcp::resolver resolver(ioCtx_);
     auto endpoints = resolver.resolve(host, std::to_string(port));
 
     startConnectTimer(timeoutMs);
-    asio::async_connect(socket_, endpoints,
-        asio::bind_executor(strand_, [self = shared_from_this()](const asio::error_code& ec, auto&) {
+    boost::asio::async_connect(socket_, endpoints,
+        boost::asio::bind_executor(strand_, [self = shared_from_this()](const boost::system::error_code& ec, auto&) {
             self->cancelConnectTimer();
             if (!ec) {
                 // Auto-bind
@@ -104,7 +106,7 @@ void TurboNetClient::sendPacket(uint8_t packetId,
     std::memcpy(pkt.data() + 6, &beSeq, 4);
     std::memcpy(pkt.data() + 10, data, len);
 
-    asio::post(strand_, [self = shared_from_this(), pkt = std::move(pkt)]() mutable {
+    boost::asio::post(strand_, [self = shared_from_this(), pkt = std::move(pkt)]() mutable {
         bool writing = !self->txBuffer_.empty();
         self->txBuffer_.insert(self->txBuffer_.end(), pkt.begin(), pkt.end());
         if (!writing) self->doWrite();
@@ -120,7 +122,7 @@ uint32_t TurboNetClient::sendRequest(const uint8_t* data, std::size_t len) {
 
 void TurboNetClient::close() {
     running_ = false;
-    asio::error_code ec;
+    boost::system::error_code ec;
     socket_.close(ec);
     cancelConnectTimer();
     cancelReadTimer();
@@ -136,13 +138,13 @@ void TurboNetClient::close() {
 // I/O Implementation
 void TurboNetClient::doReadHeader() {
     startReadTimer();
-    asio::async_read(socket_, asio::buffer(headerBuf_),
-        asio::bind_executor(strand_, [self = shared_from_this()](auto ec, auto n) {
+    boost::asio::async_read(socket_, boost::asio::buffer(headerBuf_),
+        boost::asio::bind_executor(strand_, [self = shared_from_this()](auto ec, auto n) {
             self->onReadHeader(ec, n);
         }));
 }
 
-void TurboNetClient::onReadHeader(const asio::error_code& ec, std::size_t) {
+void TurboNetClient::onReadHeader(const boost::system::error_code& ec, std::size_t) {
     if (ec) { cancelReadTimer(); return; }
 
     uint32_t packetLen = fromBigEndian(headerBuf_.data());
@@ -156,13 +158,13 @@ void TurboNetClient::onReadHeader(const asio::error_code& ec, std::size_t) {
 
 void TurboNetClient::doReadBody(uint32_t bodyLen) {
     bodyBuf_.resize(bodyLen);
-    asio::async_read(socket_, asio::buffer(bodyBuf_),
-        asio::bind_executor(strand_, [self = shared_from_this()](auto ec, auto n) {
+    boost::asio::async_read(socket_, boost::asio::buffer(bodyBuf_),
+        boost::asio::bind_executor(strand_, [self = shared_from_this()](auto ec, auto n) {
             self->onReadBody(ec, n);
         }));
 }
 
-void TurboNetClient::onReadBody(const asio::error_code& ec, std::size_t) {
+void TurboNetClient::onReadBody(const boost::system::error_code& ec, std::size_t) {
     cancelReadTimer();
     if (!ec) {
         // Bind-response
@@ -180,13 +182,13 @@ void TurboNetClient::onReadBody(const asio::error_code& ec, std::size_t) {
 
 void TurboNetClient::doWrite() {
     startWriteTimer();
-    asio::async_write(socket_, asio::buffer(txBuffer_),
-        asio::bind_executor(strand_, [self = shared_from_this()](auto ec, auto n) {
+    boost::asio::async_write(socket_, boost::asio::buffer(txBuffer_),
+        boost::asio::bind_executor(strand_, [self = shared_from_this()](auto ec, auto n) {
             self->onWrite(ec, n);
         }));
 }
 
-void TurboNetClient::onWrite(const asio::error_code& ec, std::size_t) {
+void TurboNetClient::onWrite(const boost::system::error_code& ec, std::size_t) {
     cancelWriteTimer();
     if (!ec) txBuffer_.clear();
 }
@@ -195,42 +197,42 @@ void TurboNetClient::onWrite(const asio::error_code& ec, std::size_t) {
 void TurboNetClient::startConnectTimer(int timeoutMs) {
     if (timeoutMs <= 0) return;
     connectTimer_.expires_after(std::chrono::milliseconds(timeoutMs));
-    connectTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
+    connectTimer_.async_wait(boost::asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
         self->onConnectTimeout(ec);
     }));
 }
 void TurboNetClient::cancelConnectTimer() {
-    asio::error_code ec; connectTimer_.cancel(ec);
+    boost::system::error_code ec; connectTimer_.cancel(ec);
 }
-void TurboNetClient::onConnectTimeout(const asio::error_code& ec) {
+void TurboNetClient::onConnectTimeout(const boost::system::error_code& ec) {
     if (!ec) socket_.close();
 }
 
 void TurboNetClient::startReadTimer() {
     if (readTimeoutMs_ <= 0) return;
     readTimer_.expires_after(std::chrono::milliseconds(readTimeoutMs_));
-    readTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
+    readTimer_.async_wait(boost::asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
         self->onReadTimeout(ec);
     }));
 }
 void TurboNetClient::cancelReadTimer() {
-    asio::error_code ec; readTimer_.cancel(ec);
+    boost::system::error_code ec; readTimer_.cancel(ec);
 }
-void TurboNetClient::onReadTimeout(const asio::error_code& ec) {
+void TurboNetClient::onReadTimeout(const boost::system::error_code& ec) {
     if (!ec) socket_.close();
 }
 
 void TurboNetClient::startWriteTimer() {
     if (writeTimeoutMs_ <= 0) return;
     writeTimer_.expires_after(std::chrono::milliseconds(writeTimeoutMs_));
-    writeTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
+    writeTimer_.async_wait(boost::asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
         self->onWriteTimeout(ec);
     }));
 }
 void TurboNetClient::cancelWriteTimer() {
-    asio::error_code ec; writeTimer_.cancel(ec);
+    boost::system::error_code ec; writeTimer_.cancel(ec);
 }
-void TurboNetClient::onWriteTimeout(const asio::error_code& ec) {
+void TurboNetClient::onWriteTimeout(const boost::system::error_code& ec) {
     if (!ec) socket_.close();
 }
 
@@ -244,7 +246,7 @@ void TurboNetClient::startResponseTimer(uint32_t sequence) {
         responseQueue_.push({sequence, expiry});
     }
     responseSweepTimer_.expires_after(std::chrono::milliseconds(responseTimeoutMs_));
-    responseSweepTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
+    responseSweepTimer_.async_wait(boost::asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
         self->checkAndFireResponseTimers(ec);
     }));
 }
@@ -254,7 +256,7 @@ void TurboNetClient::cancelResponseTimer(uint32_t sequence) {
     responseMap_.erase(sequence);
 }
 
-void TurboNetClient::checkAndFireResponseTimers(const asio::error_code& ec) {
+void TurboNetClient::checkAndFireResponseTimers(const boost::system::error_code& ec) {
     if (ec) return;
     auto now = std::chrono::steady_clock::now();
     std::vector<uint32_t> expired;
@@ -276,7 +278,7 @@ void TurboNetClient::checkAndFireResponseTimers(const asio::error_code& ec) {
         if (!responseQueue_.empty()) next = responseQueue_.top().expiry;
     }
     responseSweepTimer_.expires_at(next);
-    responseSweepTimer_.async_wait(asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
+    responseSweepTimer_.async_wait(boost::asio::bind_executor(strand_, [self = shared_from_this()](auto ec) {
         self->checkAndFireResponseTimers(ec);
     }));
 }

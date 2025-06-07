@@ -1,16 +1,17 @@
 #pragma once
 
-#include <asio.hpp>
+#include <boost/asio.hpp>
+
+#include <queue>
+#include <mutex>
 #include <thread>
 #include <atomic>
-#include <functional>
-#include <vector>
 #include <memory>
-#include <unordered_map>
-#include <mutex>
-#include <cstdint>
+#include <vector>
 #include <chrono>
-#include <queue>
+#include <cstdint>
+#include <functional>
+#include <unordered_map>
 
 namespace turbonet {
 
@@ -34,7 +35,7 @@ public:
     void connect(const std::string& host,
                  uint16_t port,
                  int timeoutMs,
-                 std::function<void(const asio::error_code&)> onConnect);
+                 std::function<void(const boost::system::error_code&)> onConnect);
 
     // Set client-side ID to bind
     void setClientId(const std::string& clientId);
@@ -63,42 +64,42 @@ public:
 private:
     // I/O methods
     void doReadHeader();
-    void onReadHeader(const asio::error_code& ec, std::size_t bytes_transferred);
+    void onReadHeader(const boost::system::error_code& ec, std::size_t bytes_transferred);
     void doReadBody(uint32_t bodyLen);
-    void onReadBody(const asio::error_code& ec, std::size_t bytes_transferred);
+    void onReadBody(const boost::system::error_code& ec, std::size_t bytes_transferred);
     void doWrite();
-    void onWrite(const asio::error_code& ec, std::size_t bytes_transferred);
+    void onWrite(const boost::system::error_code& ec, std::size_t bytes_transferred);
 
     // Timers
     void startConnectTimer(int timeoutMs);
     void cancelConnectTimer();
-    void onConnectTimeout(const asio::error_code& ec);
+    void onConnectTimeout(const boost::system::error_code& ec);
 
     void startReadTimer();
     void cancelReadTimer();
-    void onReadTimeout(const asio::error_code& ec);
+    void onReadTimeout(const boost::system::error_code& ec);
 
     void startWriteTimer();
     void cancelWriteTimer();
-    void onWriteTimeout(const asio::error_code& ec);
+    void onWriteTimeout(const boost::system::error_code& ec);
 
     // Response timeout management
     void startResponseTimer(uint32_t sequence);
     void cancelResponseTimer(uint32_t sequence);
-    void checkAndFireResponseTimers(const asio::error_code& ec);
+    void checkAndFireResponseTimers(const boost::system::error_code& ec);
 
     // Endian
     static uint32_t toBigEndian(uint32_t v);
     static uint32_t fromBigEndian(const uint8_t* b);
 
-    asio::io_context                                  ioCtx_;
-    asio::executor_work_guard<asio::io_context::executor_type> workGuard_;
-    asio::ip::tcp::socket                             socket_;
-    asio::steady_timer                                connectTimer_;
-    asio::steady_timer                                readTimer_;
-    asio::steady_timer                                writeTimer_;
-    asio::steady_timer                                responseSweepTimer_;
-    asio::strand<asio::io_context::executor_type>     strand_;
+    boost::asio::io_context                                  ioCtx_;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> workGuard_;
+    boost::asio::ip::tcp::socket                             socket_;
+    boost::asio::steady_timer                                connectTimer_;
+    boost::asio::steady_timer                                readTimer_;
+    boost::asio::steady_timer                                writeTimer_;
+    boost::asio::steady_timer                                responseSweepTimer_;
+    boost::asio::strand<boost::asio::io_context::executor_type>     strand_;
     std::vector<std::thread>                          ioThreads_;
     std::atomic<bool>                                 running_{false};
 
@@ -110,7 +111,7 @@ private:
     TimeoutHandler                                    onTimeout_;
     BindHandler                                       onBind_;
     CloseHandler onClose_;
-    std::function<void(const asio::error_code&)>      connectHandler_;
+    std::function<void(const boost::system::error_code&)>      connectHandler_;
 
     int                                               readTimeoutMs_;
     int                                               writeTimeoutMs_;

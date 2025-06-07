@@ -14,7 +14,7 @@ int main() {
     // 2. Connect downstream to processor at localhost:9000
     auto client = std::make_shared<TurboNetClient>(5000, 5000, 10000);
     client->connect("127.0.0.1", 9000, 3000,
-        [&](const asio::error_code& ec){
+        [&](const boost::system::error_code& ec){
             if (ec) std::cerr << "Downstream connect failed: " << ec.message() << "\n";
             else    std::cout << "Connected downstream\n";
         });

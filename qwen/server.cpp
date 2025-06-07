@@ -12,7 +12,7 @@
 #include <functional>
 #include <ctime>
 
-using boost::asio::ip::tcp;
+using boost::boost::asio::ip::tcp;
 
 // Packet Types
 constexpr uint8_t PKT_BIND_REQ = 0x01;
@@ -40,7 +40,7 @@ using response_callback = std::function<void(const std::vector<uint8_t>&, uint8_
 struct PendingRequest {
     response_callback callback;
     uint8_t expected_type;
-    std::shared_ptr<boost::asio::steady_timer> timer;
+    std::shared_ptr<boost::boost::asio::steady_timer> timer;
 };
 
 class session : public boost::enable_shared_from_this<session> {
@@ -76,18 +76,18 @@ public:
 
 private:
     tcp::socket socket_;
-    boost::asio::io_context::strand strand_;
+    boost::boost::asio::io_context::strand strand_;
     session_id_type session_id_;
     enum { length_size = 4 };
     uint8_t length_buffer_[length_size];
     std::vector<uint8_t> message_buffer_;
     std::deque<std::vector<uint8_t>> write_queue_;
 
-    std::shared_ptr<boost::asio::steady_timer> heartbeat_timer_;
+    std::shared_ptr<boost::boost::asio::steady_timer> heartbeat_timer_;
     uint32_t last_heartbeat_seq_ = 0;
 
     void start_heartbeat() {
-        heartbeat_timer_ = std::make_shared<boost::asio::steady_timer>(socket_.get_executor());
+        heartbeat_timer_ = std::make_shared<boost::boost::asio::steady_timer>(socket_.get_executor());
         heartbeat_timer_->expires_after(std::chrono::seconds(10));
         heartbeat_timer_->async_wait([this](const boost::system::error_code& ec) {
             if (!ec) {
@@ -95,7 +95,7 @@ private:
                 if (server_.lock()) {
                     server_.lock()->remove_session(session_id_);
                 }
-            } else if (ec != boost::asio::error::operation_aborted) {
+            } else if (ec != boost::boost::asio::error::operation_aborted) {
                 std::cerr << "Heartbeat timer error: " << ec.message() << std::endl;
             }
         });
@@ -107,8 +107,8 @@ private:
 
     void do_read_length() {
         auto self(shared_from_this());
-        boost::asio::async_read(socket_, boost::asio::buffer(length_buffer_, length_size),
-            boost::asio::bind_executor(strand_, [this, self](boost::system::error_code ec, std::size_t) {
+        boost::boost::asio::async_read(socket_, boost::boost::asio::buffer(length_buffer_, length_size),
+            boost::boost::asio::bind_executor(strand_, [this, self](boost::system::error_code ec, std::size_t) {
                 if (!ec) {
                     uint32_t packet_length = ntohl(*reinterpret_cast<uint32_t*>(length_buffer_));
                     if (packet_length < 10) return;
@@ -127,8 +127,8 @@ private:
 
     void do_read_body(uint32_t packet_length) {
         auto self(shared_from_this());
-        boost::asio::async_read(socket_, boost::asio::buffer(message_buffer_.data(), message_buffer_.size()),
-            boost::asio::bind_executor(strand_, [this, self, packet_length](boost::system::error_code ec, std::size_t) {
+        boost::boost::asio::async_read(socket_, boost::boost::asio::buffer(message_buffer_.data(), message_buffer_.size()),
+            boost::boost::asio::bind_executor(strand_, [this, self, packet_length](boost::system::error_code ec, std::size_t) {
                 if (!ec) {
                     handle_packet(packet_length);
                     do_read_length();
@@ -197,8 +197,8 @@ private:
         strand_.dispatch([this]() {
             if (write_queue_.empty()) return;
             auto& packet = write_queue_.front();
-            boost::asio::async_write(socket_, boost::asio::buffer(packet),
-                boost::asio::bind_executor(strand_, [this](boost::system::error_code ec, std::size_t) {
+            boost::boost::asio::async_write(socket_, boost::boost::asio::buffer(packet),
+                boost::boost::asio::bind_executor(strand_, [this](boost::system::error_code ec, std::size_t) {
                     if (!ec) {
                         write_queue_.pop_front();
                         if (!write_queue_.empty()) {
@@ -229,7 +229,7 @@ public:
         double avg_session_time;
     };
 
-    server(boost::asio::io_context& io_context, short port,
+    server(boost::boost::asio::io_context& io_context, short port,
            std::time_t max_idle_time_seconds = 300)
         : io_context_(io_context),
           acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
@@ -248,7 +248,7 @@ public:
         uint32_t sequence = generate_sequence_number();
 
         if (callback && expected_response_type != 0) {
-            auto timer = std::make_shared<boost::asio::steady_timer>(io_context_);
+            auto timer = std::make_shared<boost::boost::asio::steady_timer>(io_context_);
             timer->expires_after(timeout);
 
             auto self = shared_from_this();
@@ -282,7 +282,7 @@ public:
         uint32_t sequence = generate_sequence_number();
 
         if (callback && expected_response_type != 0) {
-            auto timer = std::make_shared<boost::asio::steady_timer>(io_context_);
+            auto timer = std::make_shared<boost::boost::asio::steady_timer>(io_context_);
             timer->expires_after(timeout);
 
             auto self = shared_from_this();
@@ -372,7 +372,7 @@ public:
     }
 
 private:
-    boost::asio::io_context& io_context_;
+    boost::boost::asio::io_context& io_context_;
     tcp::acceptor acceptor_;
     std::map<session_id_type, boost::weak_ptr<session>> sessions_;
     std::map<session_id_type, SessionMetadata> session_metadata_;
@@ -420,7 +420,7 @@ private:
     }
 
     void start_expiration_timer() {
-        expiration_timer_ = std::make_shared<boost::asio::steady_timer>(io_context_);
+        expiration_timer_ = std::make_shared<boost::boost::asio::steady_timer>(io_context_);
         expiration_timer_->expires_after(std::chrono::seconds(30));
         expiration_timer_->async_wait([this](const boost::system::error_code&) {
             check_expired_sessions();
@@ -456,7 +456,7 @@ private:
         return nullptr;
     }
 
-    std::shared_ptr<boost::asio::steady_timer> expiration_timer_;
+    std::shared_ptr<boost::boost::asio::steady_timer> expiration_timer_;
 };
 
 int main(int argc, char* argv[]) {
@@ -466,7 +466,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        boost::asio::io_context io_context;
+        boost::boost::asio::io_context io_context;
         auto server_instance = std::make_shared<server>(
             io_context, std::atoi(argv[1]), 300);
 
