@@ -14,27 +14,18 @@ public:
     TCPClient(boost::asio::io_context& io_context,
               const boost::asio::ip::tcp::resolver::results_type& endpoints);
 
-    // Call this method after constructing the client (via a shared_ptr)
-    // to begin connecting.
+    // Start the connection process. Must be called after constructing the shared_ptr.
     void start();
 
-    // Sends a request that waits up to timeout_seconds for a response.
-    // If a response is received before the timeout, on_response is called.
-    // Otherwise, on_timeout is invoked.
-    //
-    // Parameters:
-    // - body: the message body to send.
-    // - packet_type: type of the packet (default 0x01, meaning "request").
-    // - status: any status value (default 0).
+    // Send a request using the underlying session.
+    // - body: the message payload to send.
     // - timeout_seconds: how many seconds to wait for a response.
-    // - on_response: callback when a response is received.
-    // - on_timeout: callback when the request times out.
+    // - on_response: called when a response is received.
+    // - on_timeout: called if no response is received in time.
     void send_request(const std::vector<char>& body,
-                      uint8_t packet_type = 0x01,
-                      uint8_t status = 0,
-                      int timeout_seconds = 5,
-                      std::function<void(const std::vector<char>&)> on_response = nullptr,
-                      std::function<void()> on_timeout = nullptr);
+                      int timeout_seconds,
+                      std::function<void(const std::vector<char>&)> on_response,
+                      std::function<void()> on_timeout);
 
 private:
     void start_connect();
@@ -46,12 +37,6 @@ private:
     boost::asio::ip::tcp::resolver::results_type endpoints_;
     std::shared_ptr<Session> session_;
     boost::asio::steady_timer reconnect_timer_;
-
-    uint32_t next_sequence_ { 1 };
-    // Maps each request's sequence number to its callbacks.
-    std::map<uint32_t, PendingRequest> pending_requests_;
-    // Maps each request's sequence number to its timeout timer.
-    std::map<uint32_t, std::shared_ptr<boost::asio::steady_timer>> pending_timers_;
 };
 
 #endif // TCPCLIENT_H
