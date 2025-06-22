@@ -16,30 +16,44 @@ void TCPServer::do_accept() {
     acceptor_.async_accept(
         [this](boost::system::error_code ec, tcp::socket socket) {
             if (!ec) {
-                // Create a new session using the stored io_context_ instead of acceptor_.get_executor().context()
                 auto session = std::make_shared<Session>(io_context_);
                 session->socket() = std::move(socket);
                 session->start();
+
+                // Handle inbound requests from the client.
                 session->on_packet_received = [session](const PacketHeader& header, const std::vector<char>& body) {
-                    if (header.packet_type == 0x01) {  // Request packet
-                        std::cout << "Server received request with sequence: " << header.sequence << std::endl;
-                        // Prepare a response by echoing the request body
+                    if (header.packet_type == 0x01) {  // Incoming client request.
+                        std::cout << "Server received a request with sequence: " << header.sequence << std::endl;
+                        // For example, echo the request body back as a response.
                         PacketHeader responseHeader;
-                        responseHeader.packet_type = 0x02; // Response
-                        responseHeader.status = 0;         // Success status
+                        responseHeader.packet_type = 0x02; // Response.
+                        responseHeader.status = 0;         // Indicating success.
                         responseHeader.sequence = header.sequence;
                         responseHeader.packet_length = PacketHeader::header_length + static_cast<uint32_t>(body.size());
 
                         std::vector<char> packet(responseHeader.packet_length);
                         responseHeader.to_buffer(packet.data());
-                        if (!body.empty()) {
+                        if (!body.empty())
                             std::memcpy(packet.data() + PacketHeader::header_length, body.data(), body.size());
-                        }
+
                         session->write(packet);
                     }
                 };
+
+                // Now, let the server also initiate a request to the client.
+                // For example, ask the client for additional information.
+                std::string requestMessage = "Hello from server!";
+                std::vector<char> requestBody(requestMessage.begin(), requestMessage.end());
+                session->send_request(requestBody, 5,
+                    [](const std::vector<char>& response) {
+                        std::cout << "Server got response: "
+                                  << std::string(response.begin(), response.end()) << std::endl;
+                    },
+                    [](){
+                        std::cerr << "Server's request timed out." << std::endl;
+                    }
+                );
             }
-            // Continue accepting new connections regardless of errors.
             do_accept();
         });
 }

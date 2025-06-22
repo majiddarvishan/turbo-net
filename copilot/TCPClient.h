@@ -9,12 +9,6 @@
 #include <boost/asio.hpp>
 #include "Session.h"
 
-// Structure to store callbacks for a pending request.
-struct PendingRequest {
-    std::function<void(const std::vector<char>&)> on_response;
-    std::function<void()> on_timeout;
-};
-
 class TCPClient : public std::enable_shared_from_this<TCPClient> {
 public:
     TCPClient(boost::asio::io_context& io_context,
