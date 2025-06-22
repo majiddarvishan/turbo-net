@@ -5,3 +5,5 @@ Does this spark any ideas or questions about further enhancements? Perhaps youâ€
 What are some performance optimization techniques for TCP libraries?
 
 This modular design provides a strong foundation for further enhancements such as SSL/TLS support, robust error handling, and multithreading (using strands if needed). Enjoy refining your networking library
+
+reconnection strategies?

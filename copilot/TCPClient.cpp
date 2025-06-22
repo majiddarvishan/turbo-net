@@ -12,6 +12,11 @@ TCPClient::TCPClient(boost::asio::io_context& io_context,
       endpoints_(endpoints),
       reconnect_timer_(io_context)
 {
+    // Remove start_connect() call from here.
+}
+
+// Public start method; call this after creation.
+void TCPClient::start() {
     start_connect();
 }
 
@@ -46,7 +51,7 @@ void TCPClient::send_request(const std::vector<char>& body,
     });
     pending_timers_[sequence] = timer;
 
-    // Save a callback to process the response when it arrives.
+    // Save callback to process the response when it arrives.
     pending_responses_[sequence] = [sequence](const std::vector<char>& response_body) {
         std::cout << "Received response for sequence " << sequence << std::endl;
         // Process response_body as needed.
@@ -57,7 +62,7 @@ void TCPClient::send_request(const std::vector<char>& body,
 }
 
 void TCPClient::start_connect() {
-    auto self = shared_from_this();
+    auto self = shared_from_this();  // Now safe because the object is fully constructed.
     boost::asio::async_connect(socket_, endpoints_,
         [this, self](boost::system::error_code ec, tcp::endpoint) {
             if (!ec) {

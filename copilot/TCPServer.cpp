@@ -6,7 +6,8 @@
 using boost::asio::ip::tcp;
 
 TCPServer::TCPServer(boost::asio::io_context& io_context, short port)
-    : acceptor_(io_context, tcp::endpoint(tcp::v4(), port))
+    : io_context_(io_context),
+      acceptor_(io_context, tcp::endpoint(tcp::v4(), port))
 {
     do_accept();
 }
@@ -15,7 +16,8 @@ void TCPServer::do_accept() {
     acceptor_.async_accept(
         [this](boost::system::error_code ec, tcp::socket socket) {
             if (!ec) {
-                auto session = std::make_shared<Session>(acceptor_.get_executor().context());
+                // Create a new session using the stored io_context_ instead of acceptor_.get_executor().context()
+                auto session = std::make_shared<Session>(io_context_);
                 session->socket() = std::move(socket);
                 session->start();
                 session->on_packet_received = [session](const PacketHeader& header, const std::vector<char>& body) {
@@ -37,6 +39,7 @@ void TCPServer::do_accept() {
                     }
                 };
             }
+            // Continue accepting new connections regardless of errors.
             do_accept();
         });
 }

@@ -34,7 +34,11 @@ int main(int argc, char* argv[]) {
             std::string port = argv[3];
             tcp::resolver resolver(io_context);
             auto endpoints = resolver.resolve(host, port);
+
+            // Create the client as a shared pointer.
             auto client = std::make_shared<TCPClient>(io_context, endpoints);
+            // Now call start() after construction.
+            client->start();
 
             // Run io_context in a background thread.
             std::thread t([&io_context]() { io_context.run(); });

@@ -14,6 +14,9 @@ public:
     TCPClient(boost::asio::io_context& io_context,
               const boost::asio::ip::tcp::resolver::results_type& endpoints);
 
+    // Call this method after constructing the client to begin connecting.
+    void start();
+
     // Sends a request with the provided body. Defaults to packet_type 0x01 (request),
     // status 0, and a timeout (in seconds) for waiting the response.
     void send_request(const std::vector<char>& body,
