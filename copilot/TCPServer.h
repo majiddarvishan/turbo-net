@@ -12,7 +12,7 @@ public:
 private:
     void do_accept();
 
-    boost::asio::io_context& io_context_;  // Store the io_context reference.
+    boost::asio::io_context& io_context_;
     boost::asio::ip::tcp::acceptor acceptor_;
 };
 

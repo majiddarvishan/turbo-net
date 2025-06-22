@@ -2,8 +2,6 @@
 #include "PacketHeader.h"
 #include <iostream>
 #include <chrono>
-#include <thread>
-#include <cstdlib>
 using boost::asio::ip::tcp;
 
 TCPClient::TCPClient(boost::asio::io_context& io_context,
@@ -13,7 +11,7 @@ TCPClient::TCPClient(boost::asio::io_context& io_context,
       endpoints_(endpoints),
       reconnect_timer_(io_context)
 {
-    // Do not call start_connect() here; instead, call start() after constructing the object.
+    // Do not call start_connect() here. Instead, call start() after constructing a shared_ptr.
 }
 
 void TCPClient::start() {
@@ -25,16 +23,17 @@ void TCPClient::start_connect() {
     boost::asio::async_connect(socket_, endpoints_,
         [this, self](boost::system::error_code ec, tcp::endpoint) {
             if (!ec) {
-                // Create a new session using the updated Session class.
+                // Create a new Session (which uses a BufferPool and TimerEntry object pool).
                 session_ = std::make_shared<Session>(io_context_);
                 session_->socket() = std::move(socket_);
                 session_->start();
                 set_session(session_);
             } else {
-                std::cerr << "Connect error: " << ec.message() << std::endl;
+                std::cerr << "Connection error: " << ec.message() << "\n";
                 schedule_reconnect();
             }
-        });
+        }
+    );
 }
 
 void TCPClient::schedule_reconnect() {
@@ -48,21 +47,21 @@ void TCPClient::schedule_reconnect() {
 
 void TCPClient::set_session(std::shared_ptr<Session> session) {
     session_ = session;
-    // Set a callback to handle any packets not recognized as responses.
-    session_->on_packet_received = [this](const PacketHeader& header, const std::vector<char>& body) {
-        std::cout << "Client received unhandled packet (sequence " << header.sequence << ")" << std::endl;
-        // Additional handling can be added here.
+    // As an example, set a generic handler for packets that are not responses.
+    session_->on_packet_received = [this](const PacketHeader& header, std::string_view body_view) {
+        std::cout << "Client received unhandled packet, seq: "
+                  << header.sequence << " body: " << std::string(body_view) << "\n";
     };
 }
 
 void TCPClient::send_request(const std::vector<char>& body,
                              int timeout_seconds,
-                             std::function<void(const std::vector<char>&)> on_response,
+                             std::function<void(std::string_view)> on_response,
                              std::function<void()> on_timeout)
 {
     if (session_) {
         session_->send_request(body, timeout_seconds, on_response, on_timeout);
     } else {
-        std::cerr << "Session not available. Cannot send request." << std::endl;
+        std::cerr << "No active session available. Unable to send request!\n";
     }
 }

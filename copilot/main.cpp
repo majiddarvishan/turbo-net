@@ -52,7 +52,7 @@ int main(int argc, char* argv[]) {
 
             // Send a request. The client will wait for a response for 5 seconds.
             // Provide a custom on_response and timeout callback.
-            client->send_request(body, 5, [](const std::vector<char>& response_body) {
+            client->send_request(body, 5, [](std::string_view response_body) {
                     std::cout << "Custom: Received response: "
                             << std::string(response_body.begin(), response_body.end()) << std::endl;
                 },
