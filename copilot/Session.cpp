@@ -1,12 +1,12 @@
 #include "Session.h"
 #include <iostream>
 #include <cstring>
-#include <chrono>
+#include <algorithm>
 using boost::asio::ip::tcp;
 
 Session::Session(boost::asio::io_context& io_context)
-    : io_context_(io_context)
-    , socket_(io_context)
+    : socket_(io_context)
+    , timeout_timer_(std::make_shared<boost::asio::steady_timer>(io_context))
 {
 }
 
@@ -77,17 +77,13 @@ void Session::process_packet(const PacketHeader& header, const std::vector<char>
     if (header.packet_type == 0x02) {
         auto it = pending_requests_.find(header.sequence);
         if (it != pending_requests_.end()) {
-            // Cancel the associated timeout.
-            auto timerIt = pending_timers_.find(header.sequence);
-            if (timerIt != pending_timers_.end()) {
-                timerIt->second->cancel();
-                pending_timers_.erase(timerIt);
-            }
             // Call the on_response callback.
             auto callback = it->second.on_response;
             pending_requests_.erase(it);
             if (callback)
                 callback(body);
+            // Reschedule the timer as the earliest deadline may have changed.
+            schedule_timeout_timer();
             return;
         }
     }
@@ -114,28 +110,59 @@ void Session::send_request(const std::vector<char>& body,
     if (!body.empty())
         std::memcpy(packet.data() + PacketHeader::header_length, body.data(), body.size());
 
-    // Set up the timeout timer.
-    auto timer = std::make_shared<boost::asio::steady_timer>(io_context_);
-    // auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_io_context());
-    timer->expires_after(std::chrono::seconds(timeout_seconds));
-    timer->async_wait([this, sequence](boost::system::error_code ec) {
-        if (!ec) {
-            auto it = pending_requests_.find(sequence);
-            if (it != pending_requests_.end()) {
-                if (it->second.on_timeout)
-                    it->second.on_timeout();
-                pending_requests_.erase(it);
-            }
-        }
-    });
-    pending_timers_[sequence] = timer;
-
-    // Store the callbacks.
+    // Create a pending request entry with an expiration deadline.
     PendingRequest req;
     req.on_response = on_response;
     req.on_timeout = on_timeout;
+    req.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
     pending_requests_[sequence] = req;
 
-    // Finally, write the packet.
+    // Send the packet.
     write(packet);
+
+    // Update the timeout timer to fire at the earliest deadline.
+    schedule_timeout_timer();
+}
+
+void Session::schedule_timeout_timer() {
+    if (pending_requests_.empty()) {
+        timeout_timer_->cancel();
+        return;
+    }
+
+    // Find the earliest deadline among pending requests.
+    auto now = std::chrono::steady_clock::now();
+    auto earliest = std::min_element(
+        pending_requests_.begin(), pending_requests_.end(),
+        [](const auto &a, const auto &b) {
+            return a.second.deadline < b.second.deadline;
+        });
+
+    // Determine the duration until that deadline.
+    auto wait_duration = earliest->second.deadline - now;
+    timeout_timer_->expires_after(wait_duration);
+
+    auto self(shared_from_this());
+    timeout_timer_->async_wait([this, self](boost::system::error_code ec) {
+        if (ec)
+            return; // likely cancelled
+
+        auto now = std::chrono::steady_clock::now();
+        std::vector<uint32_t> expired;
+        for (auto& [seq, req] : pending_requests_) {
+            if (req.deadline <= now) {
+                if (req.on_timeout)
+                    req.on_timeout();
+                expired.push_back(seq);
+            }
+        }
+        // Remove expired requests.
+        for (auto seq : expired)
+            pending_requests_.erase(seq);
+
+        // Reschedule the timer for the next pending request, if any.
+        if (!pending_requests_.empty()) {
+            schedule_timeout_timer();
+        }
+    });
 }

@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.10)
 project(TCPNetworkingLibrary)
 
 # Set the C++ standard (C++11 in this case)
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find Boost (we are using Boost.Asio which requires at least Boost.System)
