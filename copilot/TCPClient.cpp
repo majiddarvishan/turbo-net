@@ -3,6 +3,7 @@
 #include <iostream>
 #include <chrono>
 #include <cstring>
+
 using boost::asio::ip::tcp;
 
 TCPClient::TCPClient(boost::asio::io_context& io_context,
@@ -12,10 +13,10 @@ TCPClient::TCPClient(boost::asio::io_context& io_context,
       endpoints_(endpoints),
       reconnect_timer_(io_context)
 {
-    // Remove start_connect() call from here.
+    // Do not call start_connect() here.
+    // It will be invoked in the start() method once the object is owned by a shared_ptr.
 }
 
-// Public start method; call this after creation.
 void TCPClient::start() {
     start_connect();
 }
@@ -23,7 +24,9 @@ void TCPClient::start() {
 void TCPClient::send_request(const std::vector<char>& body,
                              uint8_t packet_type,
                              uint8_t status,
-                             int timeout_seconds)
+                             int timeout_seconds,
+                             std::function<void(const std::vector<char>&)> on_response,
+                             std::function<void()> on_timeout)
 {
     uint32_t sequence = next_sequence_++;
     PacketHeader header;
@@ -32,37 +35,45 @@ void TCPClient::send_request(const std::vector<char>& body,
     header.sequence = sequence;
     header.packet_length = PacketHeader::header_length + static_cast<uint32_t>(body.size());
 
+    // Prepare full packet.
     std::vector<char> packet(header.packet_length);
     header.to_buffer(packet.data());
     if (!body.empty())
         std::memcpy(packet.data() + PacketHeader::header_length, body.data(), body.size());
 
-    // Set up a timer for this request's timeout.
+    // Create and start a timer for this request's timeout.
     auto timer = std::make_shared<boost::asio::steady_timer>(io_context_);
+    pending_timers_[sequence] = timer;
     timer->expires_after(std::chrono::seconds(timeout_seconds));
     timer->async_wait([this, sequence](boost::system::error_code ec) {
         if (!ec) {
-            auto it = pending_responses_.find(sequence);
-            if (it != pending_responses_.end()) {
-                std::cerr << "Request timed out for sequence: " << sequence << std::endl;
-                pending_responses_.erase(it);
+            auto it = pending_requests_.find(sequence);
+            if (it != pending_requests_.end()) {
+                if (it->second.on_timeout) {
+                    // Call the user-specified timeout function.
+                    it->second.on_timeout();
+                } else {
+                    std::cerr << "Request timed out for sequence: " << sequence << std::endl;
+                }
+                pending_requests_.erase(it);
             }
         }
     });
-    pending_timers_[sequence] = timer;
 
-    // Save callback to process the response when it arrives.
-    pending_responses_[sequence] = [sequence](const std::vector<char>& response_body) {
-        std::cout << "Received response for sequence " << sequence << std::endl;
-        // Process response_body as needed.
-    };
+    // Store callbacks for response and timeout.
+    PendingRequest req;
+    req.on_response = on_response ? on_response :
+        [sequence](const std::vector<char>&) { std::cout << "Received response for sequence " << sequence << std::endl; };
+    req.on_timeout = on_timeout;
+    pending_requests_[sequence] = req;
 
+    // Write the packet if the session is ready.
     if (session_)
         session_->write(packet);
 }
 
 void TCPClient::start_connect() {
-    auto self = shared_from_this();  // Now safe because the object is fully constructed.
+    auto self = shared_from_this();  // Safe here because start() is called after construction.
     boost::asio::async_connect(socket_, endpoints_,
         [this, self](boost::system::error_code ec, tcp::endpoint) {
             if (!ec) {
@@ -87,17 +98,21 @@ void TCPClient::schedule_reconnect() {
 void TCPClient::set_session(std::shared_ptr<Session> session) {
     session_ = session;
     session_->on_packet_received = [this](const PacketHeader& header, const std::vector<char>& body) {
-        // Process responses (packet_type 0x02).
+        // Process responses: expecting packet_type 0x02.
         if (header.packet_type == 0x02) {
-            auto it = pending_responses_.find(header.sequence);
-            if (it != pending_responses_.end()) {
-                pending_timers_[header.sequence]->cancel();
-                pending_timers_.erase(header.sequence);
-                auto callback = it->second;
-                pending_responses_.erase(it);
+            auto it = pending_requests_.find(header.sequence);
+            if (it != pending_requests_.end()) {
+                // Cancel the timeout timer.
+                auto timerIt = pending_timers_.find(header.sequence);
+                if (timerIt != pending_timers_.end()) {
+                    timerIt->second->cancel();
+                    pending_timers_.erase(timerIt);
+                }
+                // Invoke the response callback.
+                auto callback = it->second.on_response;
+                pending_requests_.erase(it);
                 callback(body);
             }
         }
-        // Additional handling for incoming requests can be added here.
     };
 }

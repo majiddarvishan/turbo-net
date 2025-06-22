@@ -51,7 +51,15 @@ int main(int argc, char* argv[]) {
             std::vector<char> body(message.begin(), message.end());
 
             // Send a request. The client will wait for a response for 5 seconds.
-            client->send_request(body, 0x01, 0, 5);
+            // Provide a custom on_response and timeout callback.
+            client->send_request(body, 0x01, 0, 5, [](const std::vector<char>& response_body) {
+                    std::cout << "Custom: Received response: "
+                            << std::string(response_body.begin(), response_body.end()) << std::endl;
+                },
+                []() {
+                    std::cerr << "Custom: Request timed out!" << std::endl;
+                }
+            );
 
             // Wait before shutting down to allow for response processing.
             std::this_thread::sleep_for(std::chrono::seconds(5));
