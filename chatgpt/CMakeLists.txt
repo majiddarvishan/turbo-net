@@ -18,16 +18,22 @@ include_directories(${Boost_INCLUDE_DIRS})
 # Optionally include the current source directory if needed for header files
 include_directories(${CMAKE_SOURCE_DIR})
 
-# List files to compile; header files do not need to be explicitly compiled.
-set(SOURCES
-    main.cpp
-    high_performance_tcp_lib.cpp
+add_executable(client
+               client.cpp
+               high_performance_tcp_lib.cpp
 )
 
-add_executable(${PROJECT_NAME} ${SOURCES})
+target_link_libraries(client
+    Boost::system
+    Threads::Threads
+)
 
-# Link against Boost.System and Threads libraries.
-target_link_libraries(${PROJECT_NAME}
+add_executable(server
+               server.cpp
+               high_performance_tcp_lib.cpp
+)
+
+target_link_libraries(server
     Boost::system
     Threads::Threads
 )
