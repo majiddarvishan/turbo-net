@@ -21,9 +21,6 @@ include_directories(${CMAKE_SOURCE_DIR})
 # List files to compile; header files do not need to be explicitly compiled.
 set(SOURCES
     main.cpp
-    Session.cpp
-    TCPClient.cpp
-    TCPServer.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})
@@ -35,15 +32,15 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 
-add_executable(perf
-    performance.cpp
-    Session.cpp
-    TCPClient.cpp
-    TCPServer.cpp
-)
+# add_executable(perf
+#     performance.cpp
+#     Session.cpp
+#     TCPClient.cpp
+#     TCPServer.cpp
+# )
 
-# Link against Boost.System and Threads libraries.
-target_link_libraries(perf
-    Boost::system
-    Threads::Threads
-)
+# # Link against Boost.System and Threads libraries.
+# target_link_libraries(perf
+#     Boost::system
+#     Threads::Threads
+# )
