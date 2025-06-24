@@ -21,6 +21,7 @@ include_directories(${CMAKE_SOURCE_DIR})
 # List files to compile; header files do not need to be explicitly compiled.
 set(SOURCES
     main.cpp
+    high_performance_tcp_lib.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})
