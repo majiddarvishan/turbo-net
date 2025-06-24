@@ -17,17 +17,9 @@ Connection::~Connection() {
 }
 
 // Callback setters
-void Connection::onRequest(RequestHandler h) {
-    requestHandler_ = std::move(h);
-}
-
-void Connection::onResponse(ResponseHandler h) {
-    responseHandler_ = std::move(h);
-}
-
-void Connection::onError(ErrorHandler h) {
-    errorHandler_ = std::move(h);
-}
+void Connection::onRequest(RequestHandler h) { requestHandler_ = std::move(h); }
+void Connection::onResponse(ResponseHandler h) { responseHandler_ = std::move(h); }
+void Connection::onError(ErrorHandler h) { errorHandler_ = std::move(h); }
 
 void Connection::start() {
     doReadHeader();
@@ -100,13 +92,8 @@ void Connection::close() {
 Server::Server(boost::asio::io_context& ioc, const boost::asio::ip::tcp::endpoint& ep)
     : acceptor_(ioc, ep) {}
 
-void Server::startAccept() {
-    doAccept();
-}
-
-void Server::onClientConnect(ConnectHandler h) {
-    connectHandler_ = std::move(h);
-}
+void Server::startAccept() { doAccept(); }
+void Server::onClientConnect(ConnectHandler h) { connectHandler_ = std::move(h); }
 
 void Server::doAccept() {
     acceptor_.async_accept([this](boost::system::error_code ec, boost::asio::ip::tcp::socket sock) {
@@ -134,16 +121,16 @@ Client::Client(boost::asio::io_context& ioc,
     , config_(cfg)
     , nextSequence_(1) {}
 
-void Client::start() {
-    doConnect();
-}
-
+void Client::start() { doConnect(); }
 void Client::stop() {
     reconnectTimer_.cancel();
     watchdogTimer_.cancel();
     boost::system::error_code ec;
     socket_.close(ec);
 }
+
+void Client::onBindResp(BindHandler h) { bindHandler_ = std::move(h); }
+void Client::onError(ErrorHandler h) { errorHandler_ = std::move(h); }
 
 void Client::doConnect() {
     auto self = shared_from_this();
@@ -164,8 +151,17 @@ void Client::doConnect() {
 
 void Client::scheduleReconnect() {
     reconnectTimer_.expires_after(config_.reconnect_interval);
-    reconnectTimer_.async_wait([this](boost::system::error_code ec) {
-        if (!ec) doConnect();
+    reconnectTimer_.async_wait([this](boost::system::error_code ec) { if (!ec) doConnect(); });
+}
+
+void Client::scheduleTimeout(uint32_t seq) {
+    auto timer = std::make_shared<boost::asio::steady_timer>(io_context_);
+    timer->expires_after(config_.request_timeout);
+    timer->async_wait([this, seq, timer](boost::system::error_code ec) {
+        if (!ec && pendingRequests_.count(seq)) {
+            pendingRequests_.erase(seq);
+            if (errorHandler_) errorHandler_(boost::asio::error::timed_out);
+        }
     });
 }
 
@@ -183,14 +179,7 @@ void Client::sendRequest(const Packet& pkt, ResponseCallback cb) {
 
     boost::asio::async_write(socket_, boost::asio::buffer(buf), [this, seq](auto ec, auto) {
         if (ec) { if (errorHandler_) errorHandler_(ec); return; }
-        auto timer = std::make_shared<boost::asio::steady_timer>(io_context_);
-        timer->expires_after(config_.request_timeout);
-        timer->async_wait([this, seq, timer](auto ec) {
-            if (!ec && pendingRequests_.count(seq)) {
-                pendingRequests_.erase(seq);
-                if (errorHandler_) errorHandler_(boost::asio::error::timed_out);
-            }
-        });
+        scheduleTimeout(seq);
     });
 }
 
@@ -212,9 +201,7 @@ void Client::sendBind() {
 
 void Client::scheduleWatchdog() {
     watchdogTimer_.expires_after(config_.watchdog_interval);
-    watchdogTimer_.async_wait([this](boost::system::error_code ec) {
-        if (!ec) sendWatchdog();
-    });
+    watchdogTimer_.async_wait([this](boost::system::error_code ec) { if (!ec) sendWatchdog(); });
 }
 
 void Client::sendWatchdog() {
