@@ -57,26 +57,47 @@ Buffer Connection::dequeueWrite() {
 
 void Connection::sendPacket(const Packet& pkt) {
     auto self = shared_from_this();
+    // prepare header in network byte order
     Header hdr = pkt.header;
     hdr.packet_length = htonl(hdr.packet_length);
-    auto &bodyBuf = acquireBuffer(pkt.body.size());
-    std::copy(pkt.body.begin(), pkt.body.end(), bodyBuf.begin());
+    // total packet size
+    std::size_t totalSize = sizeof(Header) + pkt.body.size();
+    // get a pooled buffer big enough
+    Buffer &concat = acquireBuffer(totalSize);
+    // copy header + body into that buffer
+    std::memcpy(concat.data(), &hdr, sizeof(Header));
+    std::copy(pkt.body.begin(), pkt.body.end(), concat.begin() + sizeof(Header));
 
-    std::vector<boost::asio::const_buffer> bufs = {
-        boost::asio::buffer(&hdr, sizeof(Header)),
-        boost::asio::buffer(bodyBuf)
-    };
-
-    boost::asio::post(strand_, [this, self, bufs=std::move(bufs)]() mutable {
+    boost::asio::post(strand_, [this, self, concat=std::move(concat)]() {
         bool writing = (count_ > 0);
-        // flatten into one buffer for ring
-        Buffer concat(sizeof(Header) + boost::asio::buffer_size(bufs[1]));
-        std::memcpy(concat.data(), bufs[0].data(), sizeof(Header));
-        std::memcpy(concat.data()+sizeof(Header), bufs[1].data(), boost::asio::buffer_size(bufs[1]));
-        enqueueWrite(std::move(concat));
+        enqueueWrite(concat);
         if (!writing) doWrite();
     });
 }
+
+
+// void Connection::sendPacket(const Packet& pkt) {
+//     auto self = shared_from_this();
+//     Header hdr = pkt.header;
+//     hdr.packet_length = htonl(hdr.packet_length);
+//     auto &bodyBuf = acquireBuffer(pkt.body.size());
+//     std::copy(pkt.body.begin(), pkt.body.end(), bodyBuf.begin());
+
+//     std::vector<boost::asio::const_buffer> bufs = {
+//         boost::asio::buffer(&hdr, sizeof(Header)),
+//         boost::asio::buffer(bodyBuf)
+//     };
+
+//     boost::asio::post(strand_, [this, self, bufs=std::move(bufs)]() mutable {
+//         bool writing = (count_ > 0);
+//         // flatten into one buffer for ring
+//         Buffer concat(sizeof(Header) + boost::asio::buffer_size(bufs[1]));
+//         std::memcpy(concat.data(), bufs[0].data(), sizeof(Header));
+//         std::memcpy(concat.data()+sizeof(Header), bufs[1].data(), boost::asio::buffer_size(bufs[1]));
+//         enqueueWrite(std::move(concat));
+//         if (!writing) doWrite();
+//     });
+// }
 
 void Connection::doReadHeader() {
     auto self = shared_from_this();
