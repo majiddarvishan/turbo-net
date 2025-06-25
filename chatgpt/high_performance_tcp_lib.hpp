@@ -36,7 +36,7 @@ enum class Status : uint8_t {
 
 #pragma pack(push, 1)
 struct Header {
-    uint32_t packet_length; // total length incl. header (network byte order)
+    uint32_t packet_length;
     PacketType type;
     Status status;
     uint32_t sequence;
@@ -59,7 +59,6 @@ struct Config {
     std::chrono::seconds watchdog_interval{30};
 };
 
-// Base connection handling async I/O and fragmentation
 class Connection : public std::enable_shared_from_this<Connection> {
 public:
     using ErrorHandler    = std::function<void(const boost::system::error_code&)>;
@@ -77,23 +76,33 @@ public:
     void onResponse(ResponseHandler h);
     void onError(ErrorHandler h);
 
-protected:
+private:
+    // Async I/O
     void doReadHeader();
     void doReadBody();
     void doWrite();
+
+    // Buffer pooling
+    Buffer& acquireBuffer(std::size_t sz);
+    std::vector<Buffer> bufferPool_;
+    std::size_t poolIndex_;
+
+    // Flat ring write queue
+    std::vector<Buffer> ring_;
+    std::size_t head_, tail_, count_;
+    void enqueueWrite(Buffer buf);
+    Buffer dequeueWrite();
 
     boost::asio::ip::tcp::socket socket_;
     boost::asio::strand<boost::asio::any_io_executor> strand_;
     Header readHeader_;
     Buffer readBody_;
-    std::deque<Buffer> writeQueue_;
 
     RequestHandler requestHandler_;
     ResponseHandler responseHandler_;
     ErrorHandler errorHandler_;
 };
 
-// Server accepting connections
 class Server {
 public:
     using ConnectHandler = std::function<void(ConnectionPtr)>;
@@ -108,7 +117,6 @@ private:
     ConnectHandler connectHandler_;
 };
 
-// Client with reconnect, timeout, watchdog
 class Client : public std::enable_shared_from_this<Client> {
 public:
     using ResponseCallback = std::function<void(const Packet&)>;
@@ -118,6 +126,8 @@ public:
     Client(boost::asio::io_context& ioc,
            const boost::asio::ip::tcp::endpoint& ep,
            Config cfg = {});
+    ~Client();
+
     void start();
     void stop();
     void sendRequest(const Packet& pkt, ResponseCallback cb);
@@ -130,14 +140,12 @@ private:
     void scheduleReconnect();
     void scheduleTimeout(uint32_t seq);
     void scheduleWatchdog();
-
-    void handlePacket(const Packet& pkt);
     void sendBind();
-    void sendWatchdog();
+    void handlePacket(const Packet& pkt);
 
+    boost::asio::ip::tcp::socket socket_;
     boost::asio::io_context& io_context_;
     boost::asio::ip::tcp::endpoint endpoint_;
-    boost::asio::ip::tcp::socket socket_;
     boost::asio::steady_timer reconnectTimer_;
     boost::asio::steady_timer watchdogTimer_;
     Config config_;

@@ -1,7 +1,25 @@
-Sample usage/demo code
 
 Unit tests or integration tests
 
 Improvements to the sequence generator or thread-safety
 
 Enhanced logging or metrics instrumentation
+
+
+Zero-copy writes
+Instead of concatenating header+body into one big std::vector<uint8_t>, you can issue a scatter/gather write (two buffers: one for the header, one for the body). That skips the extra memory copy and allocation for large payloads.
+
+Buffer pooling / reuse
+Allocating and freeing network buffers on every send/receive is costly. A simple object-pool (e.g. a boost::lockfree::stack of pre-allocated std::vector<uint8_t>) lets you recycle buffers.
+
+Avoid std::deque of boost::asio::const_buffer
+Instead of a std::deque, you can use a flat ring buffer for pending writes (indexing into a single contiguous array) which reduces pointer indirection and allocations.
+
+Minimize strand overhead
+If you don’t share a single Connection across multiple threads, you can drop the strand entirely and rely on one io_context thread per connection.
+
+Reserve containers up front
+Call .reserve() on your buffer pools and on your std::unordered_map of pending requests to avoid re-hashing under load.
+
+Batch small messages
+If you know you’re sending many small packets, consider coalescing them into one larger asynchronous write.
