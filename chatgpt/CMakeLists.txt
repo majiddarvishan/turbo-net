@@ -19,8 +19,10 @@ include_directories(${Boost_INCLUDE_DIRS})
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_executable(client
+               exp_client.cpp
+
                client.cpp
-               high_performance_tcp_lib.cpp
+               connection.cpp
 )
 
 target_link_libraries(client
@@ -29,8 +31,10 @@ target_link_libraries(client
 )
 
 add_executable(server
+               exp_server.cpp
+
                server.cpp
-               high_performance_tcp_lib.cpp
+               connection.cpp
 )
 
 target_link_libraries(server

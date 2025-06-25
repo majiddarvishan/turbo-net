@@ -104,64 +104,6 @@ private:
     ResponseHandler responseHandler_;
     ErrorHandler errorHandler_;
 };
-
-class Server {
-public:
-    Server(boost::asio::io_context& ioc,
-           const boost::asio::ip::tcp::endpoint& ep,
-           Config cfg = {});
-    ~Server();
-
-    void startAccept();
-    // clientId callback
-    void onBind(std::function<void(const std::string&)> cb);
-    // send to specific client
-    void sendRequest(const std::string& clientId,
-                     const Packet& pkt,
-                     std::function<void(const Packet&)> cb);
-
-private:
-    class Impl;
-    std::unique_ptr<Impl> impl_;
-};
-
-class Client : public std::enable_shared_from_this<Client> {
-public:
-    Client(boost::asio::io_context& ioc,
-           const boost::asio::ip::tcp::endpoint& ep,
-           Config cfg = {});
-    ~Client();
-
-    void start();
-    void stop();
-    void sendRequest(const Packet& pkt,
-                     std::function<void(const Packet&)> cb);
-
-    void onBindResp(std::function<void(const Packet&)> cb);
-    void onError(ErrorHandler cb);
-
-private:
-    void doConnect();
-    void scheduleReconnect();
-    void scheduleWatchdog();
-    void handlePacket(const Packet& pkt);
-    void sendBind();
-    void scheduleTimeoutWheel();
-
-    boost::asio::ip::tcp::socket socket_;
-    boost::asio::io_context& io_context_;
-    boost::asio::ip::tcp::endpoint endpoint_;
-    boost::asio::steady_timer reconnectTimer_;
-    boost::asio::steady_timer watchdogTimer_;
-    boost::asio::steady_timer timeoutTimer_;
-    Config config_;
-    std::atomic<uint32_t> nextSequence_{1};
-    std::unordered_map<uint32_t, std::function<void(const Packet&)>> pendingRequests_;
-    std::map<std::chrono::steady_clock::time_point, std::vector<uint32_t>> timeoutWheel_;
-    std::function<void(const Packet&)> bindHandler_;
-    ErrorHandler errorHandler_;
-};
-
 } // namespace hpnet
 
 #endif // HIGH_PERFORMANCE_TCP_LIB_HPP
