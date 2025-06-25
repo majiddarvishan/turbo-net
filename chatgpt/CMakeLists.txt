@@ -14,15 +14,15 @@ find_package(Boost REQUIRED COMPONENTS system)
 find_package(Threads REQUIRED)
 
 # Include the Boost includes
-include_directories(${Boost_INCLUDE_DIRS})
+include_directories(${Boost_INCLUDE_DIRS} include/)
 # Optionally include the current source directory if needed for header files
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_executable(client
                exp_client.cpp
 
-               client.cpp
-               connection.cpp
+               include/client.cpp
+               include/connection.cpp
 )
 
 target_link_libraries(client
@@ -33,8 +33,8 @@ target_link_libraries(client
 add_executable(server
                exp_server.cpp
 
-               server.cpp
-               connection.cpp
+               include/server.cpp
+               include/connection.cpp
 )
 
 target_link_libraries(server

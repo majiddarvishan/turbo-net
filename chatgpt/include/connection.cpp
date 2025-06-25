@@ -4,12 +4,6 @@
 #include <map>
 
 namespace hpnet {
-
-////////////////////////////////////////////////////////
-// Connection Implementation
-////////////////////////////////////////////////////////
-
-
 Connection::Connection(boost::asio::ip::tcp::socket socket)
     : socket_(std::move(socket)),
       strand_(socket_.get_executor()),
