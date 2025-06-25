@@ -76,6 +76,8 @@ public:
     void onResponse(ResponseHandler h);
     void onError(ErrorHandler h);
 
+    void sendResponse(const Packet& request, const Buffer& body, Status status = Status::Ok);
+
 private:
     // I/O
     void doReadHeader();

@@ -117,6 +117,16 @@ void Connection::doWrite() {
         }));
 }
 
+void Connection::sendResponse(const Packet& request, const Buffer& body, Status status) {
+    Packet resp;
+    resp.header.sequence = request.header.sequence;
+    resp.header.type = static_cast<PacketType>(static_cast<uint8_t>(request.header.type) | 0x80);
+    resp.header.status = status;
+    resp.body = body;
+    resp.header.packet_length = sizeof(Header) + resp.body.size();
+    sendPacket(resp);
+}
+
 void Connection::close() {
     boost::system::error_code ec;
     socket_.close(ec);
