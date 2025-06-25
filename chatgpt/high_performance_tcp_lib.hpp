@@ -7,16 +7,16 @@
 #include <boost/system/error_code.hpp>
 #include <cstdint>
 #include <vector>
-#include <deque>
 #include <unordered_map>
 #include <functional>
 #include <memory>
 #include <atomic>
 #include <chrono>
+#include <map>
 
 namespace hpnet {
 
-// Packet type definitions
+// Packet types
 enum class PacketType : uint8_t {
     BindReq     = 0x01,
     BindResp    = 0x81,
@@ -28,15 +28,15 @@ enum class PacketType : uint8_t {
     WatchdogResp= 0x84
 };
 
-// Status byte
+// Status codes
 enum class Status : uint8_t {
     Ok    = 0x00,
     Error = 0xFF
 };
 
-#pragma pack(push, 1)
+#pragma pack(push,1)
 struct Header {
-    uint32_t packet_length;
+    uint32_t packet_length; // network order
     PacketType type;
     Status status;
     uint32_t sequence;
@@ -53,6 +53,10 @@ struct Packet {
 class Connection;
 using ConnectionPtr = std::shared_ptr<Connection>;
 
+using ErrorHandler    = std::function<void(const boost::system::error_code&)>;
+using RequestHandler = std::function<void(const Packet&, ConnectionPtr)>;
+using ResponseHandler = std::function<void(const Packet&)>;
+
 struct Config {
     std::chrono::seconds reconnect_interval{5};
     std::chrono::seconds request_timeout{10};
@@ -61,11 +65,7 @@ struct Config {
 
 class Connection : public std::enable_shared_from_this<Connection> {
 public:
-    using ErrorHandler    = std::function<void(const boost::system::error_code&)>;
-    using RequestHandler  = std::function<void(const Packet&, ConnectionPtr)>;
-    using ResponseHandler = std::function<void(const Packet&)>;
-
-    Connection(boost::asio::ip::tcp::socket socket);
+    explicit Connection(boost::asio::ip::tcp::socket socket);
     ~Connection();
 
     void start();
@@ -77,19 +77,19 @@ public:
     void onError(ErrorHandler h);
 
 private:
-    // Async I/O
+    // I/O
     void doReadHeader();
     void doReadBody();
     void doWrite();
 
-    // Buffer pooling
+    // Buffer pool
     Buffer& acquireBuffer(std::size_t sz);
     std::vector<Buffer> bufferPool_;
-    std::size_t poolIndex_;
+    std::size_t poolIndex_{};
 
-    // Flat ring write queue
+    // Ring write queue
     std::vector<Buffer> ring_;
-    std::size_t head_, tail_, count_;
+    std::size_t head_{}, tail_{}, count_{};
     void enqueueWrite(Buffer buf);
     Buffer dequeueWrite();
 
@@ -105,24 +105,26 @@ private:
 
 class Server {
 public:
-    using ConnectHandler = std::function<void(ConnectionPtr)>;
+    Server(boost::asio::io_context& ioc,
+           const boost::asio::ip::tcp::endpoint& ep,
+           Config cfg = {});
+    ~Server();
 
-    Server(boost::asio::io_context& ioc, const boost::asio::ip::tcp::endpoint& ep);
     void startAccept();
-    void onClientConnect(ConnectHandler h);
+    // clientId callback
+    void onBind(std::function<void(const std::string&)> cb);
+    // send to specific client
+    void sendRequest(const std::string& clientId,
+                     const Packet& pkt,
+                     std::function<void(const Packet&)> cb);
 
 private:
-    void doAccept();
-    boost::asio::ip::tcp::acceptor acceptor_;
-    ConnectHandler connectHandler_;
+    class Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 class Client : public std::enable_shared_from_this<Client> {
 public:
-    using ResponseCallback = std::function<void(const Packet&)>;
-    using BindHandler      = std::function<void(const Packet&)>;
-    using ErrorHandler     = std::function<void(const boost::system::error_code&)>;
-
     Client(boost::asio::io_context& ioc,
            const boost::asio::ip::tcp::endpoint& ep,
            Config cfg = {});
@@ -130,28 +132,31 @@ public:
 
     void start();
     void stop();
-    void sendRequest(const Packet& pkt, ResponseCallback cb);
+    void sendRequest(const Packet& pkt,
+                     std::function<void(const Packet&)> cb);
 
-    void onBindResp(BindHandler h);
-    void onError(ErrorHandler h);
+    void onBindResp(std::function<void(const Packet&)> cb);
+    void onError(ErrorHandler cb);
 
 private:
     void doConnect();
     void scheduleReconnect();
-    void scheduleTimeout(uint32_t seq);
     void scheduleWatchdog();
-    void sendBind();
     void handlePacket(const Packet& pkt);
+    void sendBind();
+    void scheduleTimeoutWheel();
 
     boost::asio::ip::tcp::socket socket_;
     boost::asio::io_context& io_context_;
     boost::asio::ip::tcp::endpoint endpoint_;
     boost::asio::steady_timer reconnectTimer_;
     boost::asio::steady_timer watchdogTimer_;
+    boost::asio::steady_timer timeoutTimer_;
     Config config_;
-    std::atomic<uint32_t> nextSequence_;
-    std::unordered_map<uint32_t, ResponseCallback> pendingRequests_;
-    BindHandler bindHandler_;
+    std::atomic<uint32_t> nextSequence_{1};
+    std::unordered_map<uint32_t, std::function<void(const Packet&)>> pendingRequests_;
+    std::map<std::chrono::steady_clock::time_point, std::vector<uint32_t>> timeoutWheel_;
+    std::function<void(const Packet&)> bindHandler_;
     ErrorHandler errorHandler_;
 };
 
